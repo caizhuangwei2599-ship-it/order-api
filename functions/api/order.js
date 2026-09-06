@@ -1,14 +1,15 @@
 export async function onRequest(context) {
   const { request, env } = context;
 
-  // =========新增：处理OPTIONS跨域预检请求，解决Failed to fetch =========
+  // ✅ 标准英文横杠！修复OPTIONS预检跨域
   if (request.method.toUpperCase() === "OPTIONS") {
     return new Response(null, {
       status: 204,
       headers: {
-        "Access‑Control‑Allow‑Origin": "*",
-        "Access‑Control‑Allow‑Methods": "GET, POST, OPTIONS",
-        "Access‑Control‑Allow‑Headers": "Content‑Type"
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "86400"
       }
     });
   }
@@ -18,7 +19,6 @@ export async function onRequest(context) {
   const oid = url.searchParams.get('oid');
 
   let reqBody = null;
-  // 解析POST JSON请求体，用于接收前端提交的配置
   if(request.method.toUpperCase() === "POST"){
     try{
       reqBody = await request.json();
@@ -27,10 +27,8 @@ export async function onRequest(context) {
     }
   }
 
-  // 优先读取KV中存储的动态配置
   let tokenData = await env.ORDERS.get('__token_data__', { type: 'json' });
 
-  // 如果POST传过来新的api_user/api_pwd，就更新保存到KV
   if(reqBody && reqBody.action){
     if(reqBody.api_user && reqBody.api_pwd){
       tokenData = {
@@ -44,14 +42,12 @@ export async function onRequest(context) {
     }
   }
 
-  // 读取配置，兜底降级（如果KV没有配置，使用默认空，提示用户去后台填写）
   let apiUser, apiPass, sid;
   if(tokenData && tokenData.apiUser && tokenData.apiPass){
     apiUser = tokenData.apiUser;
     apiPass = tokenData.apiPass;
     sid = tokenData.sid || "24085";
   }else{
-    // 没有配置时返回提示，告诉管理员到管理面板填写豪猪账号密码
     const poolActions = [
       'addPhone', 'removePhone', 'poolList', 'resetPool', 'releasePoolPhone', 'logList',
       'getBalance', 'lockOrder', 'blockPhone',
@@ -65,7 +61,6 @@ export async function onRequest(context) {
     sid = url.searchParams.get('sid') || '24085';
   }
 
-  // 所有无需 oid 的接口
   const poolActions = [
     'addPhone', 'removePhone', 'poolList', 'resetPool', 'releasePoolPhone', 'logList',
     'getBalance', 'lockOrder', 'blockPhone',
@@ -115,7 +110,6 @@ export async function onRequest(context) {
     return `HZ-${segment()}-${segment()}`;
   }
 
-  // Token 管理（从KV读取已经存储的账号密码，校验缓存一致性）
   let tokenStr = tokenData ? tokenData.token : null;
   let tokenExpiry = tokenData ? tokenData.expire : 0;
   const tokenApiUser = tokenData ? tokenData.apiUser : null;
@@ -146,8 +140,6 @@ export async function onRequest(context) {
 
   try {
     switch (action) {
-
-      // ========== 卡密系统 ==========
       case 'generateCard': {
         const type = url.searchParams.get('type') || 'trial';
         const count = parseInt(url.searchParams.get('count')) || 1;
@@ -215,7 +207,6 @@ export async function onRequest(context) {
         return jsonResponse({ success: true });
       }
 
-      // ========== 查询余额 ==========
       case 'getBalance': {
         const balanceResp = await fetch(`https://${HAOZHU.server}/sms/?api=getSummary&token=${tokenStr}`);
         const balanceData = await balanceResp.json();
@@ -223,7 +214,6 @@ export async function onRequest(context) {
         return jsonResponse({ error: balanceData.msg || '查询失败' });
       }
 
-      // ========== 拉黑手机号 ==========
       case 'blockPhone': {
         const phone = url.searchParams.get('phone');
         if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
@@ -238,7 +228,6 @@ export async function onRequest(context) {
         return jsonResponse({ error: blockData.msg || '拉黑失败' });
       }
 
-      // ========== 管理员强制释放订单 ==========
       case 'lockOrder': {
         if (!oid) return jsonResponse({ error: '缺少订单ID' }, 400);
         let order = await kv.get(oid, { type: 'json' });
@@ -267,7 +256,6 @@ export async function onRequest(context) {
         return jsonResponse({ success: true });
       }
 
-      // ========== 号码池管理 ==========
       case 'poolList': { const pool = await getPool(); return jsonResponse({ pool }); }
       case 'addPhone': {
         const phone = url.searchParams.get('phone');
@@ -320,13 +308,11 @@ export async function onRequest(context) {
         return jsonResponse({ success: true });
       }
 
-      // ========== 日志列表 ==========
       case 'logList': {
         const logs = await getLogs();
         return jsonResponse({ logs: logs.reverse() });
       }
 
-      // ========== 订单状态 ==========
       case 'status': {
         let order = await kv.get(oid, { type: 'json' });
         if (!order) return jsonResponse({ status: 'new', phone: null, expire: null, code: null });
@@ -345,7 +331,6 @@ export async function onRequest(context) {
         return jsonResponse(order);
       }
 
-      // ========== 获取手机号（池优先） ==========
       case 'getPhone': {
         let order = await kv.get(oid, { type: 'json' });
         if (order && order.status === 'done') return jsonResponse({ error: '订单已完成' }, 403);
@@ -396,7 +381,6 @@ export async function onRequest(context) {
         return jsonResponse({ error: phoneData.msg || '取号失败' }, 500);
       }
 
-      // ========== 释放（买家释放，状态变为 new） ==========
       case 'release': {
         let order = await kv.get(oid, { type: 'json' });
         if (!order) return jsonResponse({ error: '订单不存在' }, 404);
@@ -418,7 +402,6 @@ export async function onRequest(context) {
         return jsonResponse({ success: true });
       }
 
-      // ========== 获取验证码 ==========
       case 'getSMS': {
         const order = await kv.get(oid, { type: 'json' });
         if (!order || !order.phone) return jsonResponse({ error: '订单不存在' }, 404);
@@ -458,12 +441,13 @@ export async function onRequest(context) {
   }
 }
 
+// jsonResponse头全部使用标准英文减号
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { 
-      'Content-Type': 'application/json', 
-      'Access‑Control‑Allow‑Origin': '*' 
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
     }
   });
 }
