@@ -1,14 +1,56 @@
-
 export async function onRequest(context) {
   const { request, env } = context;
   const url = new URL(request.url);
   const action = url.searchParams.get('action');
   const oid = url.searchParams.get('oid');
-  const sid = url.searchParams.get('sid') || '24085';
 
-  // 写死的 API 账号密码（不再从 URL 读取）
-  const apiUser = '0d1f0214da0eecc534e6139e662323ab6a7c810bc67d44b78643abd2489dcd48';
-  const apiPass = '4e32e4470173719e2863d9525150bb9500218bbd7c9242c25921060810d0571c';
+  let reqBody = null;
+  // 解析POST JSON请求体，用于接收前端提交的配置
+  if(request.method.toUpperCase() === "POST"){
+    try{
+      reqBody = await request.json();
+    }catch(err){
+      reqBody = {};
+    }
+  }
+
+  // 优先读取KV中存储的动态配置
+  let tokenData = await env.ORDERS.get('__token_data__', { type: 'json' });
+
+  // 如果POST传过来新的api_user/api_pwd，就更新保存到KV
+  if(reqBody && reqBody.action){
+    if(reqBody.api_user && reqBody.api_pwd){
+      tokenData = {
+        token: null,
+        expire: 0,
+        apiUser: reqBody.api_user,
+        apiPass: reqBody.api_pwd,
+        sid: reqBody.sid || "24085"
+      };
+      await env.ORDERS.put('__token_data__', JSON.stringify(tokenData));
+    }
+  }
+
+  // 读取配置，兜底降级（如果KV没有配置，使用默认空，提示用户去后台填写）
+  let apiUser, apiPass, sid;
+  if(tokenData && tokenData.apiUser && tokenData.apiPass){
+    apiUser = tokenData.apiUser;
+    apiPass = tokenData.apiPass;
+    sid = tokenData.sid || "24085";
+  }else{
+    // 没有配置时返回提示，告诉管理员到管理面板填写豪猪账号密码
+    const poolActions = [
+      'addPhone', 'removePhone', 'poolList', 'resetPool', 'releasePoolPhone', 'logList',
+      'getBalance', 'lockOrder', 'blockPhone',
+      'generateCard', 'activateCard', 'verifyCard', 'cardList', 'deleteCard'
+    ];
+    if(poolActions.includes(action)){
+      return jsonResponse({ error: "请前往管理面板填写豪猪API账号密码后保存配置" },400);
+    }
+    apiUser = "";
+    apiPass = "";
+    sid = url.searchParams.get('sid') || '24085';
+  }
 
   // 所有无需 oid 的接口
   const poolActions = [
@@ -60,8 +102,7 @@ export async function onRequest(context) {
     return `HZ-${segment()}-${segment()}`;
   }
 
-  // Token 管理（账号密码固定，但仍校验缓存一致性）
-  let tokenData = await kv.get('__token_data__', { type: 'json' });
+  // Token 管理（从KV读取已经存储的账号密码，校验缓存一致性）
   let tokenStr = tokenData ? tokenData.token : null;
   let tokenExpiry = tokenData ? tokenData.expire : 0;
   const tokenApiUser = tokenData ? tokenData.apiUser : null;
@@ -70,6 +111,9 @@ export async function onRequest(context) {
   const needLogin = !tokenStr || Date.now() >= tokenExpiry - 300000 || tokenApiUser !== apiUser || tokenApiPass !== apiPass;
 
   if (needLogin) {
+    if(!apiUser || !apiPass){
+      return jsonResponse({error:"未配置豪猪API账号密码，请在管理面板填写保存"},400);
+    }
     const loginResp = await fetch(`https://${HAOZHU.server}/sms/?api=login&user=${HAOZHU.user}&pass=${HAOZHU.pass}`);
     const loginData = await loginResp.json();
     if (loginData.code == 0) {
@@ -79,7 +123,8 @@ export async function onRequest(context) {
         token: tokenStr,
         expire: tokenExpiry,
         apiUser: HAOZHU.user,
-        apiPass: HAOZHU.pass
+        apiPass: HAOZHU.pass,
+        sid: HAOZHU.sid
       }));
     } else {
       return jsonResponse({ error: '登录失败：' + (loginData.msg || '') }, 500);
