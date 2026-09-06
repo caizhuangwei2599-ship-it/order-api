@@ -4,6 +4,17 @@ export async function onRequest(context) {
   const action = url.searchParams.get('action');
   const oid = url.searchParams.get('oid');
 
+  // ========= 处理OPTIONS跨域预检请求 =========
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+      }
+    });
+  }
+
   let reqBody = null;
   // 解析POST JSON请求体，用于接收前端提交的配置
   if(request.method.toUpperCase() === "POST"){
@@ -41,7 +52,7 @@ export async function onRequest(context) {
     // 没有配置时返回提示，告诉管理员到管理面板填写豪猪账号密码
     const poolActions = [
       'addPhone', 'removePhone', 'poolList', 'resetPool', 'releasePoolPhone', 'logList',
-      'getBalance', 'lockOrder', 'blockPhone',
+      'getBalance', 'lockOrder', 'admin_release', 'blockPhone',
       'generateCard', 'activateCard', 'verifyCard', 'cardList', 'deleteCard'
     ];
     if(poolActions.includes(action)){
@@ -54,8 +65,8 @@ export async function onRequest(context) {
 
   // 所有无需 oid 的接口
   const poolActions = [
-    'addPhone', 'removePhone', 'poolList', 'resetPool', 'releasePoolPhone', 'logList',
-    'getBalance', 'lockOrder', 'blockPhone',
+    'addPhone', 'removePhone', 'poolList', 'resetPool', 'releasePoolPhone', 'logList', 'list',
+    'getBalance', 'lockOrder', 'admin_release', 'blockPhone',
     'generateCard', 'activateCard', 'verifyCard', 'cardList', 'deleteCard'
   ];
   if (!oid && !poolActions.includes(action)) {
@@ -133,6 +144,18 @@ export async function onRequest(context) {
 
   try {
     switch (action) {
+
+      // ========== 获取全部订单列表（admin后台） ==========
+      case "list": {
+        const kvList = await kv.list();
+        const output = [];
+        for(const k of kvList.keys){
+          if(k.name.startsWith("__")) continue;
+          const raw = await kv.get(k.name);
+          if(raw) output.push(JSON.parse(raw));
+        }
+        return jsonResponse(output);
+      }
 
       // ========== 卡密系统 ==========
       case 'generateCard': {
@@ -225,8 +248,15 @@ export async function onRequest(context) {
         return jsonResponse({ error: blockData.msg || '拉黑失败' });
       }
 
-      // ========== 管理员强制释放订单 ==========
+      // ========= 管理员强制释放订单 admin_release（带密码校验） =========
+      case 'admin_release':
       case 'lockOrder': {
+        const adminPwd = url.searchParams.get("admin_pwd");
+        // 读取环境变量 ADMIN_PASSWORD
+        const realAdminPwd = env.ADMIN_PASSWORD || "";
+        if(!adminPwd || adminPwd !== realAdminPwd){
+          return jsonResponse({error:"管理员密码错误"},403);
+        }
         if (!oid) return jsonResponse({ error: '缺少订单ID' }, 400);
         let order = await kv.get(oid, { type: 'json' });
         if (!order) return jsonResponse({ error: '订单不存在' }, 404);
@@ -251,7 +281,7 @@ export async function onRequest(context) {
         order.expire = null;
         order.code = null;
         await kv.put(oid, JSON.stringify(order));
-        return jsonResponse({ success: true });
+        return jsonResponse({ status:"ok" });
       }
 
       // ========== 号码池管理 ==========
