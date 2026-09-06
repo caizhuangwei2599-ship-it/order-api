@@ -1,5 +1,18 @@
 export async function onRequest(context) {
   const { request, env } = context;
+
+  // =========新增：处理OPTIONS跨域预检请求，解决Failed to fetch =========
+  if (request.method.toUpperCase() === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access‑Control‑Allow‑Origin": "*",
+        "Access‑Control‑Allow‑Methods": "GET, POST, OPTIONS",
+        "Access‑Control‑Allow‑Headers": "Content‑Type"
+      }
+    });
+  }
+
   const url = new URL(request.url);
   const action = url.searchParams.get('action');
   const oid = url.searchParams.get('oid');
@@ -448,6 +461,9 @@ export async function onRequest(context) {
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    headers: { 
+      'Content-Type': 'application/json', 
+      'Access‑Control‑Allow‑Origin': '*' 
+    }
   });
 }
