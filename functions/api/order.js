@@ -156,11 +156,21 @@ export async function onRequest(context) {
         return jsonResponse({ success: true });
       }
 
-      // ========== 查询余额 ==========
+      // ========== 查询余额（修改后） ==========
       case 'getBalance': {
         const balanceResp = await fetch(`https://${HAOZHU.server}/sms/?api=getSummary&token=${tokenStr}`);
         const balanceData = await balanceResp.json();
-        if (balanceData.code == 0) return jsonResponse({ balance: balanceData.balance || balanceData.summary || '未知' });
+        if (balanceData.code == 0) {
+          // 兼容多种可能的字段名
+          let bal = balanceData.balance || balanceData.summary || balanceData.money ||
+                    balanceData.data?.balance || balanceData.data?.money || balanceData.amount;
+          if (bal === undefined || bal === null) {
+            // 如果都找不到，返回错误并附带原始数据以便调试
+            console.warn('getBalance 未找到余额字段，原始响应:', balanceData);
+            return jsonResponse({ error: '未获取到余额，原始响应结构: ' + JSON.stringify(balanceData) });
+          }
+          return jsonResponse({ balance: bal });
+        }
         return jsonResponse({ error: balanceData.msg || '查询失败' });
       }
 
