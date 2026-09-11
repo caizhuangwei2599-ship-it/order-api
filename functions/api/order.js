@@ -391,7 +391,7 @@ export async function onRequest(context) {
         if (available.length > 0) {
           const chosen = available[Math.floor(Math.random() * available.length)];
           const phone = chosen.phone;
-          const expire = Date.now() + 60 * 1000;
+          const expire = Date.now() + 120 * 1000;   // ✅ 60 → 120 秒
 
           try {
             const activateUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${phone}`;
@@ -423,7 +423,7 @@ export async function onRequest(context) {
           const phone = phoneData.phone || phoneData.Phone || phoneData.mobile;
           const newOrder = {
             phone,
-            expire: Date.now() + 60 * 1000,
+            expire: Date.now() + 120 * 1000,   // ✅ 60 → 120 秒
             status: 'active',
             code: null,
             fromPool: false,
