@@ -17,7 +17,7 @@ export async function onRequest(context) {
     'createOrder',
     'listActiveOrders',
     'releaseAllOrders',
-    'cancelRecvPhone' // ✅ 新增支持指定释放手机号
+    'cancelRecvPhone'
   ];
   if (!oid && !poolActions.includes(action)) {
     return jsonResponse({ error: '缺少订单ID' }, 400);
@@ -122,42 +122,49 @@ export async function onRequest(context) {
   try {
     switch (action) {
 
-      // ========== 指定释放手机号 (按 URL 规范向平台发起 cancelRecv) ==========
+      // ========== 指定释放手机号（修复：同步切断买家端等待） ==========
       case 'cancelRecvPhone': {
         const phone = url.searchParams.get('phone');
         if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
 
         try {
+          // 1. 调用接码平台接口取消接收
           const cancelUrl = `https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(phone)}`;
           const cancelResp = await fetch(cancelUrl);
           const cancelData = await cancelResp.json();
 
-          // 同步维护本地号码池与订单状态（若该号码正被占用）
+          // 2. 检查并同步重置本地号码池
           let pool = await getPool();
           const pEntry = pool.find(p => p.phone === phone);
-          if (pEntry && pEntry.status === 'in_use') {
-            if (pEntry.oid) {
-              let order = await kv.get(pEntry.oid, { type: 'json' });
-              if (order && order.status === 'active') {
-                order.status = 'released';
-                order.phone = null;
-                order.expire = null;
-                await kv.put(pEntry.oid, JSON.stringify(order));
-              }
-            }
+          if (pEntry) {
             pEntry.status = 'available';
             pEntry.oid = null;
             pEntry.expire = null;
             await savePool(pool);
           }
 
+          // 3. 核心修复：扫描并释放绑定了该手机号的买家端订单，阻止前端继续等待
+          const keys = await kv.list();
+          for (const key of keys.keys) {
+            if (key.name.startsWith('__') || key.name === POOL_KEY || key.name === LOG_KEY || key.name === CARD_KEY) continue;
+            const order = await kv.get(key.name, { type: 'json' });
+            if (order && order.phone === phone && order.status !== 'done') {
+              order.status = 'released';
+              order.phone = null;
+              order.expire = null;
+              order.code = null;
+              await kv.put(key.name, JSON.stringify(order));
+            }
+          }
+
           if (cancelData.code == 0 || cancelData.msg?.includes('成功')) {
             return jsonResponse({ success: true, msg: cancelData.msg || '释放成功' });
           } else {
-            return jsonResponse({ success: false, error: cancelData.msg || '平台释放失败' }, 400);
+            // 即使平台提示重复取消等非零码，本地也已同步中断订单
+            return jsonResponse({ success: true, msg: cancelData.msg || '本地订单已释放' });
           }
         } catch (e) {
-          return jsonResponse({ error: '请求接码平台失败: ' + e.message }, 500);
+          return jsonResponse({ error: '请求处理失败: ' + e.message }, 500);
         }
       }
 
