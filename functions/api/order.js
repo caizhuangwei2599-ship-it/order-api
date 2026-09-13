@@ -1,5 +1,18 @@
 export async function onRequest(context) {
   const { request, env } = context;
+
+  // 处理浏览器 CORS 预检请求
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      },
+    });
+  }
+
   const url = new URL(request.url);
   const action = url.searchParams.get('action');
   const oid = url.searchParams.get('oid');
@@ -206,7 +219,7 @@ export async function onRequest(context) {
         // 仅登记订单信息，待买家打开链接请求 getPhone 时才真正开始取号倒计时
         const newOrder = {
           status: 'new',
-          assignedPhone: specifiedPhone, // 指定号码（若有）
+          assignedPhone: specifiedPhone,
           phone: null,
           expire: null,
           code: null,
@@ -391,18 +404,8 @@ export async function onRequest(context) {
         if (!order) {
           return jsonResponse({ status: 'invalid', phone: null, expire: null, code: null });
         }
-        if (order.expire && order.status === 'active' && Date.now() >= order.expire) {
-          if (order.fromPool && order.phone) {
-            let pool = await getPool();
-            const entry = pool.find(p => p.phone === order.phone);
-            if (entry && entry.status === 'in_use') {
-              entry.status = 'available'; entry.oid = null; entry.expire = null;
-              await savePool(pool);
-            }
-          }
-          order.status = 'expired';
-          await kv.put(oid, JSON.stringify(order));
-        }
+        // 【核心修改】：120秒到了之后不要改变 order.status 为 expired！
+        // 依然保持 active，买家若还想等待仍可继续接收验证码，或者买家点击“释放”按钮后再由买家手动释放
         return jsonResponse(order);
       }
 
@@ -430,7 +433,7 @@ export async function onRequest(context) {
           }
         }
 
-        // 场景 A：订单配置了【指定手机号】（买家首次打开该订单时向平台取指定号）
+        // 场景 A：订单配置了【指定手机号】
         if (order.assignedPhone) {
           const reqUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(order.assignedPhone)}`;
           const phoneResp = await fetch(reqUrl);
@@ -546,11 +549,12 @@ export async function onRequest(context) {
               order.status = 'done';
               await kv.put(oid, JSON.stringify(order));
               await addLog(order.phone, oid, 'sms_received');
-              return jsonResponse({ code: raw, status: 'done' });
+              // 【核心修复】：返回 phone 字段，确保前端在页面渲染与复制时不会出现空白
+              return jsonResponse({ code: raw, phone: order.phone, status: 'done' });
             }
           }
         }
-        return jsonResponse({ code: null, status: 'active' });
+        return jsonResponse({ code: null, phone: order.phone, status: 'active' });
       }
 
       case 'setPhone': {
@@ -572,6 +576,11 @@ export async function onRequest(context) {
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
+    }
   });
 }
