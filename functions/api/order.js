@@ -16,7 +16,8 @@ export async function onRequest(context) {
     'generateCard', 'activateCard', 'verifyCard', 'cardList', 'deleteCard',
     'createOrder',
     'listActiveOrders',
-    'releaseAllOrders'
+    'releaseAllOrders',
+    'cancelRecvPhone' // ✅ 新增支持指定释放手机号
   ];
   if (!oid && !poolActions.includes(action)) {
     return jsonResponse({ error: '缺少订单ID' }, 400);
@@ -121,6 +122,45 @@ export async function onRequest(context) {
   try {
     switch (action) {
 
+      // ========== 指定释放手机号 (按 URL 规范向平台发起 cancelRecv) ==========
+      case 'cancelRecvPhone': {
+        const phone = url.searchParams.get('phone');
+        if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+
+        try {
+          const cancelUrl = `https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(phone)}`;
+          const cancelResp = await fetch(cancelUrl);
+          const cancelData = await cancelResp.json();
+
+          // 同步维护本地号码池与订单状态（若该号码正被占用）
+          let pool = await getPool();
+          const pEntry = pool.find(p => p.phone === phone);
+          if (pEntry && pEntry.status === 'in_use') {
+            if (pEntry.oid) {
+              let order = await kv.get(pEntry.oid, { type: 'json' });
+              if (order && order.status === 'active') {
+                order.status = 'released';
+                order.phone = null;
+                order.expire = null;
+                await kv.put(pEntry.oid, JSON.stringify(order));
+              }
+            }
+            pEntry.status = 'available';
+            pEntry.oid = null;
+            pEntry.expire = null;
+            await savePool(pool);
+          }
+
+          if (cancelData.code == 0 || cancelData.msg?.includes('成功')) {
+            return jsonResponse({ success: true, msg: cancelData.msg || '释放成功' });
+          } else {
+            return jsonResponse({ success: false, error: cancelData.msg || '平台释放失败' }, 400);
+          }
+        } catch (e) {
+          return jsonResponse({ error: '请求接码平台失败: ' + e.message }, 500);
+        }
+      }
+
       // ========== 列出活跃订单 ==========
       case 'listActiveOrders': {
         const keys = await kv.list();
@@ -157,7 +197,6 @@ export async function onRequest(context) {
         let existing = await kv.get(oid, { type: 'json' });
         if (existing) return jsonResponse({ error: '订单已存在' }, 400);
 
-        // ✅ 读取号段筛选参数
         const ascription = url.searchParams.get('ascription') || '';
         const paragraph  = url.searchParams.get('paragraph')  || '';
         const exclude    = url.searchParams.get('exclude')    || '';
@@ -391,7 +430,7 @@ export async function onRequest(context) {
         if (available.length > 0) {
           const chosen = available[Math.floor(Math.random() * available.length)];
           const phone = chosen.phone;
-          const expire = Date.now() + 120 * 1000;   // ✅ 60 → 120 秒
+          const expire = Date.now() + 120 * 1000;
 
           try {
             const activateUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${phone}`;
@@ -408,7 +447,6 @@ export async function onRequest(context) {
           return jsonResponse({ phone, expire });
         }
 
-        // ✅ 号码池为空时，调用浩竹 API 取号，带上筛选参数
         const f = order.filters || {};
         let apiUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}`;
         if (f.ascription) apiUrl += `&ascription=${encodeURIComponent(f.ascription)}`;
@@ -423,7 +461,7 @@ export async function onRequest(context) {
           const phone = phoneData.phone || phoneData.Phone || phoneData.mobile;
           const newOrder = {
             phone,
-            expire: Date.now() + 120 * 1000,   // ✅ 60 → 120 秒
+            expire: Date.now() + 120 * 1000,
             status: 'active',
             code: null,
             fromPool: false,
@@ -435,7 +473,7 @@ export async function onRequest(context) {
         return jsonResponse({ error: phoneData.msg || '取号失败' }, 500);
       }
 
-      // ========== 释放（买家释放，状态变为 new） ==========
+      // ========== 释放（买家释放） ==========
       case 'release': {
         let order = await kv.get(oid, { type: 'json' });
         if (!order) return jsonResponse({ error: '订单不存在' }, 404);
