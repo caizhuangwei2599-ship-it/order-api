@@ -1,18 +1,5 @@
 export async function onRequest(context) {
   const { request, env } = context;
-
-  // 处理浏览器 CORS 预检请求
-  if (request.method === 'OPTIONS') {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
-      },
-    });
-  }
-
   const url = new URL(request.url);
   const action = url.searchParams.get('action');
   const oid = url.searchParams.get('oid');
@@ -216,9 +203,10 @@ export async function onRequest(context) {
         const isp        = url.searchParams.get('isp')        || '';
         const province   = url.searchParams.get('Province')   || '';
 
+        // 仅登记订单信息，待买家打开链接请求 getPhone 时才真正开始取号倒计时
         const newOrder = {
           status: 'new',
-          assignedPhone: specifiedPhone,
+          assignedPhone: specifiedPhone, // 指定号码（若有）
           phone: null,
           expire: null,
           code: null,
@@ -403,18 +391,19 @@ export async function onRequest(context) {
         if (!order) {
           return jsonResponse({ status: 'invalid', phone: null, expire: null, code: null });
         }
-        
-        // 计算真实的剩余秒数，防止前端时钟不准
-        let remainSeconds = 0;
-        if (order.status === 'active' && order.expire) {
-          const diff = Math.ceil((order.expire - Date.now()) / 1000);
-          remainSeconds = diff > 0 ? diff : 0;
+        if (order.expire && order.status === 'active' && Date.now() >= order.expire) {
+          if (order.fromPool && order.phone) {
+            let pool = await getPool();
+            const entry = pool.find(p => p.phone === order.phone);
+            if (entry && entry.status === 'in_use') {
+              entry.status = 'available'; entry.oid = null; entry.expire = null;
+              await savePool(pool);
+            }
+          }
+          order.status = 'expired';
+          await kv.put(oid, JSON.stringify(order));
         }
-
-        return jsonResponse({
-          ...order,
-          remain_seconds: remainSeconds
-        });
+        return jsonResponse(order);
       }
 
       // ========== 获取手机号（买家访问时调用） ==========
@@ -423,21 +412,12 @@ export async function onRequest(context) {
         if (!order) {
           return jsonResponse({ error: '订单不存在或已失效' }, 404);
         }
-        if (order.status === 'done') {
-          return jsonResponse({ status: 'done', phone: order.phone, code: order.code });
-        }
-        if (order.status === 'released') {
-          return jsonResponse({ error: '订单已被释放' }, 403);
-        }
+        if (order.status === 'done') return jsonResponse({ error: '订单已完成' }, 403);
+        if (order.status === 'released') return jsonResponse({ error: '订单已被管理员释放' }, 403);
         
-        // 【关键改动】：如果该订单已经是 active 且已有号码，无论是否过 120 秒，绝不重复取号或重置倒计时
-        if (order.status === 'active' && order.phone) {
-          const diff = Math.ceil((order.expire - Date.now()) / 1000);
-          return jsonResponse({
-            phone: order.phone,
-            expire: order.expire,
-            remain_seconds: diff > 0 ? diff : 0
-          });
+        // 如果已经取过且还在倒计时内，直接返回
+        if (order.status === 'active' && order.expire && Date.now() < order.expire) {
+          return jsonResponse({ phone: order.phone, expire: order.expire });
         }
 
         // 清理此前释放池中占用的逻辑
@@ -450,7 +430,7 @@ export async function onRequest(context) {
           }
         }
 
-        // 场景 A：订单配置了【指定手机号】
+        // 场景 A：订单配置了【指定手机号】（买家首次打开该订单时向平台取指定号）
         if (order.assignedPhone) {
           const reqUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(order.assignedPhone)}`;
           const phoneResp = await fetch(reqUrl);
@@ -464,7 +444,7 @@ export async function onRequest(context) {
             order.code = null;
             order.fromPool = false;
             await kv.put(oid, JSON.stringify(order));
-            return jsonResponse({ phone: realPhone, expire: order.expire, remain_seconds: 120 });
+            return jsonResponse({ phone: realPhone, expire: order.expire });
           } else {
             return jsonResponse({ error: '获取指定手机号失败：' + (phoneData.msg || '平台无该号或已被占用') }, 400);
           }
@@ -497,7 +477,7 @@ export async function onRequest(context) {
             fromPool: true 
           };
           await kv.put(oid, JSON.stringify(newOrder));
-          return jsonResponse({ phone, expire, remain_seconds: 120 });
+          return jsonResponse({ phone, expire });
         }
 
         // 场景 C：普通订单从接码平台动态取号
@@ -513,17 +493,16 @@ export async function onRequest(context) {
         const phoneData = await phoneResp.json();
         if (phoneData.code == 0) {
           const phone = phoneData.phone || phoneData.Phone || phoneData.mobile;
-          const expire = Date.now() + 120 * 1000;
           const newOrder = {
             ...order,
             phone,
-            expire,
+            expire: Date.now() + 120 * 1000,
             status: 'active',
             code: null,
             fromPool: false
           };
           await kv.put(oid, JSON.stringify(newOrder));
-          return jsonResponse({ phone, expire, remain_seconds: 120 });
+          return jsonResponse({ phone, expire: newOrder.expire });
         }
         return jsonResponse({ error: phoneData.msg || '取号失败' }, 500);
       }
@@ -545,10 +524,7 @@ export async function onRequest(context) {
           try { await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`); } catch(e) {}
         }
 
-        order.status = 'new'; 
-        order.phone = null; 
-        order.expire = null; 
-        order.code = null;
+        order.status = 'new'; order.phone = null; order.expire = null; order.code = null;
         await kv.put(oid, JSON.stringify(order));
         return jsonResponse({ success: true });
       }
@@ -570,11 +546,11 @@ export async function onRequest(context) {
               order.status = 'done';
               await kv.put(oid, JSON.stringify(order));
               await addLog(order.phone, oid, 'sms_received');
-              return jsonResponse({ code: raw, phone: order.phone, status: 'done' });
+              return jsonResponse({ code: raw, status: 'done' });
             }
           }
         }
-        return jsonResponse({ code: null, phone: order.phone, status: 'active' });
+        return jsonResponse({ code: null, status: 'active' });
       }
 
       case 'setPhone': {
@@ -596,11 +572,6 @@ export async function onRequest(context) {
 function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
-    }
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
 }
