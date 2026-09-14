@@ -202,6 +202,7 @@ export async function onRequest(context) {
         const exclude    = url.searchParams.get('exclude')    || '';
         const isp        = url.searchParams.get('isp')        || '';
         const province   = url.searchParams.get('Province')   || '';
+        const uid        = url.searchParams.get('uid')        || ''; // 已修复：新增获取 uid 参数
 
         // 仅登记订单信息，待买家打开链接请求 getPhone 时才真正开始取号倒计时
         const newOrder = {
@@ -211,7 +212,7 @@ export async function onRequest(context) {
           expire: null,
           code: null,
           fromPool: false,
-          filters: { ascription, paragraph, exclude, isp, province }
+          filters: { ascription, paragraph, exclude, isp, province, uid } // 已修复：在 filters 中保存 uid
         };
         await kv.put(oid, JSON.stringify(newOrder));
         return jsonResponse({ success: true });
@@ -488,6 +489,7 @@ export async function onRequest(context) {
         if (f.exclude)    apiUrl += `&exclude=${encodeURIComponent(f.exclude)}`;
         if (f.isp)        apiUrl += `&isp=${encodeURIComponent(f.isp)}`;
         if (f.province)   apiUrl += `&Province=${encodeURIComponent(f.province)}`;
+        if (f.uid)        apiUrl += `&uid=${encodeURIComponent(f.uid)}`; // 已修复：新增向平台传递 uid 参数
 
         const phoneResp = await fetch(apiUrl);
         const phoneData = await phoneResp.json();
