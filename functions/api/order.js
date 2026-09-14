@@ -63,30 +63,33 @@ export async function onRequest(context) {
     return `HZ-${segment()}-${segment()}`;
   }
 
-  // Token 管理
-  let tokenData = await kv.get('__token_data__', { type: 'json' });
-  let tokenStr = tokenData ? tokenData.token : null;
-  let tokenExpiry = tokenData ? tokenData.expire : 0;
-  const tokenApiUser = tokenData ? tokenData.apiUser : null;
-  const tokenApiPass = tokenData ? tokenData.apiPass : null;
+  // ========== 优化：按需获取 Token（懒加载） ==========
+  async function getValidToken() {
+    let tokenData = await kv.get('__token_data__', { type: 'json' });
+    let tokenStr = tokenData ? tokenData.token : null;
+    let tokenExpiry = tokenData ? tokenData.expire : 0;
+    const tokenApiUser = tokenData ? tokenData.apiUser : null;
+    const tokenApiPass = tokenData ? tokenData.apiPass : null;
 
-  const needLogin = !tokenStr || Date.now() >= tokenExpiry - 300000 || tokenApiUser !== apiUser || tokenApiPass !== apiPass;
+    const needLogin = !tokenStr || Date.now() >= tokenExpiry - 300000 || tokenApiUser !== apiUser || tokenApiPass !== apiPass;
 
-  if (needLogin) {
-    const loginResp = await fetch(`https://${HAOZHU.server}/sms/?api=login&user=${HAOZHU.user}&pass=${HAOZHU.pass}`);
-    const loginData = await loginResp.json();
-    if (loginData.code == 0) {
-      tokenStr = loginData.token || loginData.Token || loginData.access_token;
-      tokenExpiry = Date.now() + 3500000;
-      await kv.put('__token_data__', JSON.stringify({
-        token: tokenStr,
-        expire: tokenExpiry,
-        apiUser: HAOZHU.user,
-        apiPass: HAOZHU.pass
-      }));
-    } else {
-      return jsonResponse({ error: '登录失败：' + (loginData.msg || '') }, 500);
+    if (needLogin) {
+      const loginResp = await fetch(`https://${HAOZHU.server}/sms/?api=login&user=${HAOZHU.user}&pass=${HAOZHU.pass}`);
+      const loginData = await loginResp.json();
+      if (loginData.code == 0) {
+        tokenStr = loginData.token || loginData.Token || loginData.access_token;
+        tokenExpiry = Date.now() + 3500000;
+        await kv.put('__token_data__', JSON.stringify({
+          token: tokenStr,
+          expire: tokenExpiry,
+          apiUser: HAOZHU.user,
+          apiPass: HAOZHU.pass
+        }));
+      } else {
+        throw new Error('接码平台登录失败：' + (loginData.msg || ''));
+      }
     }
+    return tokenStr;
   }
 
   // ========== 辅助函数：释放单个订单 ==========
@@ -107,6 +110,7 @@ export async function onRequest(context) {
       }
     } else if (order.phone) {
       try {
+        const tokenStr = await getValidToken(); // 需要时获取 Token
         await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`);
       } catch(e) {}
     }
@@ -128,6 +132,7 @@ export async function onRequest(context) {
         if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
 
         try {
+          const tokenStr = await getValidToken(); // 需要时获取 Token
           const cancelUrl = `https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(phone)}`;
           const cancelResp = await fetch(cancelUrl);
           const cancelData = await cancelResp.json();
@@ -204,10 +209,10 @@ export async function onRequest(context) {
         const province   = url.searchParams.get('Province')   || '';
         const uid        = url.searchParams.get('uid')        || ''; // 已修复：新增获取 uid 参数
 
-        // 仅登记订单信息，待买家打开链接请求 getPhone 时才真正开始取号倒计时
+        // 仅登记订单信息，不需要获取 Token，直接写入数据库
         const newOrder = {
           status: 'new',
-          assignedPhone: specifiedPhone, // 指定号码（若有）
+          assignedPhone: specifiedPhone,
           phone: null,
           expire: null,
           code: null,
@@ -288,6 +293,7 @@ export async function onRequest(context) {
 
       // ========== 查询余额 ==========
       case 'getBalance': {
+        const tokenStr = await getValidToken(); // 需要时获取 Token
         const balanceResp = await fetch(`https://${HAOZHU.server}/sms/?api=getSummary&token=${tokenStr}`);
         const balanceData = await balanceResp.json();
         if (balanceData.code == 0) {
@@ -305,6 +311,7 @@ export async function onRequest(context) {
       case 'blockPhone': {
         const phone = url.searchParams.get('phone');
         if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+        const tokenStr = await getValidToken(); // 需要时获取 Token
         const blockResp = await fetch(`https://${HAOZHU.server}/sms/?api=addBlacklist&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${phone}`);
         const blockData = await blockResp.json();
         if (blockData.code == 0) {
@@ -431,6 +438,8 @@ export async function onRequest(context) {
           }
         }
 
+        const tokenStr = await getValidToken(); // 需要向接码平台取号时获取 Token
+
         // 场景 A：订单配置了【指定手机号】（买家首次打开该订单时向平台取指定号）
         if (order.assignedPhone) {
           const reqUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(order.assignedPhone)}`;
@@ -489,7 +498,7 @@ export async function onRequest(context) {
         if (f.exclude)    apiUrl += `&exclude=${encodeURIComponent(f.exclude)}`;
         if (f.isp)        apiUrl += `&isp=${encodeURIComponent(f.isp)}`;
         if (f.province)   apiUrl += `&Province=${encodeURIComponent(f.province)}`;
-        if (f.uid)        apiUrl += `&uid=${encodeURIComponent(f.uid)}`; // 已修复：新增向平台传递 uid 参数
+        if (f.uid)        apiUrl += `&uid=${encodeURIComponent(f.uid)}`; // 已修复：传递 uid 参数
 
         const phoneResp = await fetch(apiUrl);
         const phoneData = await phoneResp.json();
@@ -523,7 +532,10 @@ export async function onRequest(context) {
             await savePool(pool);
           }
         } else if (order.phone) {
-          try { await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`); } catch(e) {}
+          try { 
+            const tokenStr = await getValidToken(); // 需要时获取 Token
+            await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`); 
+          } catch(e) {}
         }
 
         order.status = 'new'; order.phone = null; order.expire = null; order.code = null;
@@ -536,6 +548,7 @@ export async function onRequest(context) {
         const order = await kv.get(oid, { type: 'json' });
         if (!order || !order.phone) return jsonResponse({ error: '订单不存在' }, 404);
 
+        const tokenStr = await getValidToken(); // 需要时获取 Token
         const smsResp = await fetch(`https://${HAOZHU.server}/sms/?api=getMessage&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`);
         const smsData = await smsResp.json();
 
