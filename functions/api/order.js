@@ -120,7 +120,8 @@ export async function onRequest(context) {
     } else if (order.phone) {
       try {
         const tokenStr = await getValidToken(); // 需要时获取 Token
-        await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`);
+        const orderSid = order.sid || HAOZHU.sid; // 读取专属SID
+        await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`);
       } catch(e) {}
     }
 
@@ -234,6 +235,7 @@ export async function onRequest(context) {
         // 仅登记订单信息，不需要获取 Token，直接写入数据库
         const newOrder = {
           status: 'new',
+          sid: sid, // <--- 关键修复：把前端创建时指定的 sid 永久保存在该订单内
           assignedPhone: specifiedPhone,
           phone: null,
           expire: null,
@@ -461,10 +463,11 @@ export async function onRequest(context) {
         }
 
         const tokenStr = await getValidToken(); // 需要向接码平台取号时获取 Token
+        const orderSid = order.sid || HAOZHU.sid; // <--- 关键修复：读取保存在该订单里的 sid，找不到才兜底全局
 
         // 场景 A：订单配置了【指定手机号】（买家首次打开该订单时向平台取指定号）
         if (order.assignedPhone) {
-          const reqUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(order.assignedPhone)}`;
+          const reqUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}&phone=${encodeURIComponent(order.assignedPhone)}`;
           const phoneResp = await fetch(reqUrl);
           const phoneData = await phoneResp.json();
 
@@ -491,7 +494,7 @@ export async function onRequest(context) {
           const expire = Date.now() + 120 * 1000;
 
           try {
-            const activateUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${phone}`;
+            const activateUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}&phone=${phone}`;
             await fetch(activateUrl);
           } catch (e) {}
 
@@ -514,7 +517,7 @@ export async function onRequest(context) {
 
         // 场景 C：普通订单从接码平台动态取号
         const f = order.filters || {};
-        let apiUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${HAOZHU.sid}`;
+        let apiUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}`;
         if (f.ascription) apiUrl += `&ascription=${encodeURIComponent(f.ascription)}`;
         if (f.paragraph)  apiUrl += `&paragraph=${encodeURIComponent(f.paragraph)}`;
         if (f.exclude)    apiUrl += `&exclude=${encodeURIComponent(f.exclude)}`;
@@ -556,7 +559,8 @@ export async function onRequest(context) {
         } else if (order.phone) {
           try { 
             const tokenStr = await getValidToken(); // 需要时获取 Token
-            await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`); 
+            const orderSid = order.sid || HAOZHU.sid; // 读取专属SID
+            await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`); 
           } catch(e) {}
         }
 
@@ -571,7 +575,8 @@ export async function onRequest(context) {
         if (!order || !order.phone) return jsonResponse({ error: '订单不存在' }, 404);
 
         const tokenStr = await getValidToken(); // 需要时获取 Token
-        const smsResp = await fetch(`https://${HAOZHU.server}/sms/?api=getMessage&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${order.phone}`);
+        const orderSid = order.sid || HAOZHU.sid; // 读取专属SID
+        const smsResp = await fetch(`https://${HAOZHU.server}/sms/?api=getMessage&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`);
         const smsData = await smsResp.json();
 
         if (smsData.code == 0) {
