@@ -23,6 +23,7 @@ export async function onRequest(context) {
     'generateCard', 'activateCard', 'verifyCard', 'cardList', 'deleteCard',
     'createOrder',
     'listActiveOrders',
+    'listAllOrders', // <--- 新增：获取所有订单记录，无需 oid
     'releaseAllOrders',
     'cancelRecvPhone',
     'saveApiConfig' // <-- 新增的保存配置接口
@@ -199,6 +200,31 @@ export async function onRequest(context) {
             orders.push({ oid: key.name, phone: order.phone });
           }
         }
+        return jsonResponse({ orders });
+      }
+
+      // ========== 获取所有订单记录（含手机号与验证码） ==========
+      case 'listAllOrders': {
+        const keys = await kv.list();
+        const orders = [];
+        for (const key of keys.keys) {
+          // 过滤掉系统配置项
+          if (key.name.startsWith('__') || key.name === POOL_KEY || key.name === LOG_KEY || key.name === CARD_KEY) continue;
+          
+          const order = await kv.get(key.name, { type: 'json' });
+          if (order) {
+            orders.push({
+              oid: key.name,
+              phone: order.phone || '---',
+              assignedPhone: order.assignedPhone || '',
+              status: order.status || 'new',
+              code: order.code || '',
+              expire: order.expire || null,
+            });
+          }
+        }
+        // 按照订单号大致倒序排列（新的在前）
+        orders.sort((a, b) => b.oid.localeCompare(a.oid));
         return jsonResponse({ orders });
       }
 
