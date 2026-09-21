@@ -78,7 +78,7 @@ export async function onRequest(context) {
     const needLogin = !tokenStr || Date.now() >= tokenExpiry - 300000 || tokenApiUser !== HAOZHU.user || tokenApiPass !== HAOZHU.pass;
 
     if (needLogin) {
-      const loginResp = await fetch(`https://${HAOZHU.server}/sms/?api=login&user=${HAOZHU.user}&pass=${HAOZHU.pass}`);
+      const loginResp = await fetch(`https://${HAOZHU.server}/sms/?api=login&user=${encodeURIComponent(HAOZHU.user)}&pass=${encodeURIComponent(HAOZHU.pass)}`);
       const loginData = await loginResp.json();
       if (loginData.code == 0) {
         tokenStr = loginData.token || loginData.Token || loginData.access_token;
@@ -115,7 +115,7 @@ export async function onRequest(context) {
       try {
         const tokenStr = await getValidToken();
         const orderSid = order.sid || HAOZHU.sid;
-        await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`);
+        await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${orderSid}&phone=${encodeURIComponent(order.phone)}`);
       } catch(e) {}
     }
 
@@ -123,6 +123,7 @@ export async function onRequest(context) {
     order.phone = null;
     order.expire = null;
     order.code = null;
+    order.assignedPhone = null;
     await kv.put(oid, JSON.stringify(order));
     return { success: true };
   }
@@ -161,6 +162,7 @@ export async function onRequest(context) {
                 order.status = 'released';
                 order.phone = null;
                 order.expire = null;
+                order.assignedPhone = null;
                 await kv.put(pEntry.oid, JSON.stringify(order));
               }
             }
@@ -193,36 +195,59 @@ export async function onRequest(context) {
         return jsonResponse({ orders });
       }
 
-      // ========== 获取所有订单记录（并发优化版） ==========
+      // ========== 获取所有订单记录（分页+容错优化版） ==========
       case 'listAllOrders': {
-        const keys = await kv.list();
-        // 1. 过滤出有效的订单 key
-        const validKeys = keys.keys.filter(k => 
+        let keys = [];
+        let cursor = null;
+        let listComplete = false;
+        
+        // 1. 循环获取所有 KV Key，突破 1000 条限制
+        while (!listComplete) {
+            const options = cursor ? { cursor } : {};
+            const listRes = await kv.list(options);
+            keys = keys.concat(listRes.keys);
+            listComplete = listRes.list_complete;
+            cursor = listRes.cursor;
+        }
+
+        // 2. 过滤掉系统配置项
+        const validKeys = keys.filter(k => 
           !k.name.startsWith('__') && 
           k.name !== POOL_KEY && 
           k.name !== LOG_KEY && 
           k.name !== CARD_KEY
         );
         
-        // 2. 并发获取所有订单数据，避免超时
-        const orderPromises = validKeys.map(k => kv.get(k.name, { type: 'json' }));
-        const orderResults = await Promise.all(orderPromises);
+        const orders = [];
+        const BATCH_SIZE = 50; // 3. 分批处理，防止 Worker 并发超限崩溃
         
-        // 3. 组装数据并过滤掉空值
-        const orders = validKeys.map((k, index) => {
-          const order = orderResults[index];
-          if (!order) return null;
-          return {
-            oid: k.name,
-            phone: order.phone || '---',
-            assignedPhone: order.assignedPhone || '',
-            status: order.status || 'new',
-            code: order.code || '',
-            expire: order.expire || null,
-          };
-        }).filter(o => o !== null);
+        for (let i = 0; i < validKeys.length; i += BATCH_SIZE) {
+            const batch = validKeys.slice(i, i + BATCH_SIZE);
+            // 4. 单独捕获每一个请求的异常，防止个别数据损坏导致整体崩溃
+            const batchPromises = batch.map(k => 
+                kv.get(k.name, { type: 'json' }).catch(e => {
+                    console.error(`读取订单 ${k.name} 失败:`, e);
+                    return null; 
+                })
+            );
+            const batchResults = await Promise.all(batchPromises);
+            
+            batch.forEach((k, index) => {
+                const order = batchResults[index];
+                if (order) {
+                    orders.push({
+                        oid: k.name,
+                        phone: order.phone || '---',
+                        assignedPhone: order.assignedPhone || '',
+                        status: order.status || 'new',
+                        code: order.code || '',
+                        expire: order.expire || null,
+                    });
+                }
+            });
+        }
         
-        // 4. 按订单号倒序排列（新的在前）
+        // 5. 按订单号倒序
         orders.sort((a, b) => b.oid.localeCompare(a.oid));
         return jsonResponse({ orders });
       }
@@ -355,7 +380,7 @@ export async function onRequest(context) {
         const phone = url.searchParams.get('phone');
         if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
         const tokenStr = await getValidToken();
-        const blockResp = await fetch(`https://${HAOZHU.server}/sms/?api=addBlacklist&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${phone}`);
+        const blockResp = await fetch(`https://${HAOZHU.server}/sms/?api=addBlacklist&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(phone)}`);
         const blockData = await blockResp.json();
         if (blockData.code == 0) {
           let pool = await getPool();
@@ -400,7 +425,7 @@ export async function onRequest(context) {
           if (p.status === 'in_use' && p.oid) {
             let order = await kv.get(p.oid, { type: 'json' });
             if (order && order.status === 'active') {
-              order.status = 'released'; order.phone = null; order.expire = null;
+              order.status = 'released'; order.phone = null; order.expire = null; order.assignedPhone = null;
               await kv.put(p.oid, JSON.stringify(order));
             }
             p.status = 'available'; p.oid = null; p.expire = null;
@@ -419,7 +444,7 @@ export async function onRequest(context) {
         if (entry.oid) {
           let order = await kv.get(entry.oid, { type: 'json' });
           if (order && order.status === 'active') {
-            order.status = 'released'; order.phone = null; order.expire = null;
+            order.status = 'released'; order.phone = null; order.expire = null; order.assignedPhone = null;
             await kv.put(entry.oid, JSON.stringify(order));
           }
         }
@@ -504,7 +529,7 @@ export async function onRequest(context) {
           const expire = Date.now() + 120 * 1000;
 
           try {
-            const activateUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}&phone=${phone}`;
+            const activateUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}&phone=${encodeURIComponent(phone)}`;
             await fetch(activateUrl);
           } catch (e) {}
 
@@ -557,22 +582,38 @@ export async function onRequest(context) {
         if (!order) return jsonResponse({ error: '订单不存在' }, 404);
         if (order.status === 'done') return jsonResponse({ error: '订单已完成' }, 403);
 
-        if (order.phone && order.fromPool) {
+        const phoneParam = url.searchParams.get('phone');
+        const targetPhone = phoneParam || order.phone;
+
+        if (targetPhone && order.fromPool) {
           let pool = await getPool();
-          const entry = pool.find(p => p.phone === order.phone);
+          const entry = pool.find(p => p.phone === targetPhone);
           if (entry) {
-            entry.status = 'available'; entry.oid = null; entry.expire = null;
+            entry.status = 'available';
+            entry.oid = null;
+            entry.expire = null;
             await savePool(pool);
           }
-        } else if (order.phone) {
+        } else if (targetPhone) {
           try { 
             const tokenStr = await getValidToken();
-            const orderSid = order.sid || HAOZHU.sid;
-            await fetch(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`); 
-          } catch(e) {}
+            const cancelUrl = `https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(targetPhone)}`;
+            const cancelResp = await fetch(cancelUrl);
+            const cancelData = await cancelResp.json();
+
+            if (cancelData.code != 0 && !cancelData.msg?.includes('成功') && !cancelData.msg?.includes('已释放')) {
+              return jsonResponse({ error: '接码平台释放失败: ' + (cancelData.msg || JSON.stringify(cancelData)) }, 400);
+            }
+          } catch(e) {
+            return jsonResponse({ error: '调用平台释放接口异常: ' + e.message }, 500);
+          }
         }
 
-        order.status = 'new'; order.phone = null; order.expire = null; order.code = null;
+        order.status = 'new';
+        order.phone = null;
+        order.expire = null;
+        order.code = null;
+        order.assignedPhone = null;
         await kv.put(oid, JSON.stringify(order));
         return jsonResponse({ success: true });
       }
@@ -582,8 +623,7 @@ export async function onRequest(context) {
         if (!order || !order.phone) return jsonResponse({ error: '订单不存在' }, 404);
 
         const tokenStr = await getValidToken();
-        const orderSid = order.sid || HAOZHU.sid;
-        const smsResp = await fetch(`https://${HAOZHU.server}/sms/?api=getMessage&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`);
+        const smsResp = await fetch(`https://${HAOZHU.server}/sms/?api=getMessage&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(order.phone)}`);
         const smsData = await smsResp.json();
 
         if (smsData.code == 0) {
