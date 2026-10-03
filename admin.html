@@ -536,8 +536,8 @@
         (function() {
             'use strict';
 
-            const BUYER_PAGE = 'index.html';
-            const API_BASE = 'https://order-api-9ch.pages.dev/api/order';
+            // ⭐ 改动 1：改成相对路径，自动适配新域名
+            const API_BASE = '/api/order';
             const ADMIN_PASSWORD = 'shinia299.';
 
             const loginBox = document.getElementById('loginBox');
@@ -558,11 +558,9 @@
                 }, duration);
             }
 
-            // ===== 脏标记：记录页数据是否过期 =====
             let activeOrdersDirty = true;
             let logsDirty = true;
 
-            // ===== Tab 切换（懒加载 + 脏检查） =====
             window.switchTab = function(targetId, element) {
                 const views = document.querySelectorAll('.view');
                 views.forEach(view => view.classList.remove('active'));
@@ -581,7 +579,6 @@
                 }
             };
 
-            // ===== 折叠面板控制 =====
             window.toggleBaseConfig = function() {
                 const content = document.getElementById('baseConfigContent');
                 const icon = document.getElementById('baseConfigToggleIcon');
@@ -594,7 +591,6 @@
                 }
             };
 
-            // ===== 记住密码 =====
             function loadRemembered() {
                 const saved = localStorage.getItem('admin_remembered');
                 if (saved) {
@@ -681,7 +677,6 @@
                 document.getElementById('configExclude').value = currentCfg.exclude;
                 document.getElementById('configUid').value = currentCfg.uid;
 
-                // ===== 保存 API 配置 =====
                 window.saveApiConfig = async function() {
                     const apiUser = document.getElementById('configApiUser').value.trim();
                     const apiPass = document.getElementById('configApiPass').value.trim();
@@ -714,7 +709,6 @@
                     showToast('✅ API 配置已保存');
                 };
 
-                // ===== 保存基础配置 =====
                 window.saveBaseConfig = async function() {
                     const sid = document.getElementById('configSid').value.trim();
                     const ascription = document.getElementById('configAscription').value;
@@ -775,10 +769,10 @@
                         throw new Error(data.error || '创建订单失败');
                     }
                     activeOrdersDirty = true;
-                    return location.origin + '/' + BUYER_PAGE + '?oid=' + oid;
+                    // ⭐ 改动 2：去掉 index.html，用根路径
+                    return location.origin + '/?oid=' + oid;
                 }
 
-                // 统一结果渲染
                 function showOrderResult(htmlMsg, linkText) {
                     document.getElementById('orderSuccessMsg').innerHTML = htmlMsg;
                     document.getElementById('orderLinkText').textContent = linkText;
@@ -875,7 +869,6 @@
                     document.body.removeChild(ta);
                 }
 
-                // silent = true 时静默加载
                 window.loadActiveOrders = async function(silent) {
                     const container = document.getElementById('activeOrderList');
                     if (!silent) container.innerHTML = '<div class="list-empty">⏳ 加载中…</div>';
