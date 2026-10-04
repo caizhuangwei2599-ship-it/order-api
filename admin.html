@@ -408,7 +408,7 @@
                 </div>
             </div>
 
-            <!-- ======= 合并后的订单创建卡片 ======= -->
+            <!-- 订单创建 -->
             <div class="ios-card">
                 <div class="ios-card-header" style="margin-bottom: 10px;">
                     <span class="ios-card-title"><span class="emoji">📱</span> 订单创建</span>
@@ -439,7 +439,6 @@
                     <button class="btn-copy" onclick="copyText('orderLinkText')" style="padding: 4px 12px; font-size: 12px;">📋 复制链接</button>
                 </div>
             </div>
-            <!-- ===================================== -->
 
             <!-- 释放链接 -->
             <div class="ios-card">
@@ -461,7 +460,6 @@
 
         <!-- ============ Tab 2: 记录 ============ -->
         <div id="tab-record" class="view">
-            <!-- 活跃订单列表 -->
             <div class="ios-card">
                 <div class="ios-card-header">
                     <span class="ios-card-title"><span class="emoji">📲</span> 已获取手机号订单</span>
@@ -475,7 +473,6 @@
                 </div>
             </div>
 
-            <!-- 验证码记录 -->
             <div class="ios-card">
                 <div class="ios-card-header">
                     <span class="ios-card-title"><span class="emoji">📋</span> 验证码记录</span>
@@ -673,7 +670,6 @@
                     document.getElementById('configUid').value        = cfg.uid || '';
                 }
 
-                // 从表单收集全部配置
                 function collectConfig() {
                     return {
                         apiUser:    document.getElementById('configApiUser').value.trim(),
@@ -686,10 +682,8 @@
                     };
                 }
 
-                // 1. 先用本地缓存秒开
                 applyConfigToForm(getStoredConfig());
 
-                // 2. 从后端拉取云端配置（换设备自动同步）
                 async function loadConfigFromServer() {
                     try {
                         const resp = await fetch(`${API_BASE}?action=getApiConfig`);
@@ -713,7 +707,6 @@
                 }
                 loadConfigFromServer();
 
-                // 统一保存入口：写后端 KV + 写本地缓存
                 async function persistConfig(cfg) {
                     const qs = new URLSearchParams({
                         action:     'saveApiConfig',
@@ -782,7 +775,8 @@
                         if (curCfg.ascription) apiUrl += `&ascription=${encodeURIComponent(curCfg.ascription)}`;
                         if (curCfg.paragraph) apiUrl += `&paragraph=${encodeURIComponent(curCfg.paragraph)}`;
                         if (curCfg.exclude) apiUrl += `&exclude=${encodeURIComponent(curCfg.exclude)}`;
-                        if (curCfg.uid) apiUrl += `&uid=${encodeURIComponent(curCfg.uid)}`;
+                        // 【改动】uid 始终传参，即使为空字符串
+                        apiUrl += `&uid=${curCfg.uid ? encodeURIComponent(curCfg.uid) : ''}`;
                     }
 
                     const resp = await fetch(apiUrl);
@@ -791,7 +785,8 @@
                         throw new Error(data.error || '创建订单失败');
                     }
                     activeOrdersDirty = true;
-                    return location.origin + '/?oid=' + oid;
+                    // 【改动】路径形式链接: https://xxx/HZxxxxx
+                    return location.origin + '/' + oid;
                 }
 
                 function showOrderResult(htmlMsg, linkText) {

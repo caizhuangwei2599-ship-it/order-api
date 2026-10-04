@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
     <title>自动发货 - 获取手机号</title>
     <style>
-        /* ===== iOS 27 液态玻璃 UI 风格 ===== */
         :root {
             --bg-gradient: linear-gradient(135deg, #e8f0fe 0%, #fde8f0 40%, #e2f0ff 70%, #f0e6ff 100%);
             --glass-bg: rgba(255, 255, 255, 0.45);
@@ -52,7 +51,6 @@
 
         .hidden { display: none !important; }
 
-        /* ===== 主容器（液态玻璃核心） ===== */
         .container {
             width: 100%;
             max-width: 420px;
@@ -79,7 +77,6 @@
             transform: rotate(30deg);
         }
 
-        /* ===== 头部 ===== */
         .header { margin-bottom: 24px; position: relative; z-index: 1; }
         .header .logo {
             font-size: 28px;
@@ -95,7 +92,6 @@
         .header .subtitle { color: var(--text-secondary); font-size: 15px; margin-top: 4px; font-weight: 500; }
         .header .order-id { font-size: 13px; color: var(--text-tertiary); margin-top: 6px; font-weight: 400; letter-spacing: 0.5px; }
 
-        /* ===== 按钮 ===== */
         .btn {
             display: inline-flex;
             align-items: center;
@@ -165,7 +161,6 @@
         }
         .btn-copy:hover { border-color: var(--primary); background: rgba(0,122,255,0.08); }
 
-        /* ===== 信息卡片 ===== */
         .info-card {
             background: rgba(255, 255, 255, 0.35);
             border-radius: var(--radius-sm);
@@ -181,7 +176,6 @@
         .phone-number { font-size: 28px; font-weight: 600; letter-spacing: 2px; color: var(--text-primary); user-select: all; }
         .code-number { font-size: 36px; font-weight: 700; letter-spacing: 6px; color: var(--primary); padding: 8px 0; user-select: all; font-family: 'SF Mono', 'Consolas', monospace; }
 
-        /* ===== 状态 ===== */
         .status-text {
             font-weight: 500;
             padding: 14px 16px;
@@ -203,14 +197,12 @@
         .status-warning { background: rgba(255, 149, 0, 0.15); color: #B25900; }
         .status-error { background: rgba(255, 59, 48, 0.15); color: var(--danger); }
 
-        /* ===== 倒计时 & 轮询 ===== */
         .countdown { font-size: 18px; font-weight: 600; color: var(--warning); margin-top: 8px; }
         .polling-indicator { display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-tertiary); font-size: 14px; margin-top: 16px; position: relative; z-index: 1; }
         .polling-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); animation: pulse 1.5s ease-in-out infinite; }
         @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(1); } 50% { opacity: 1; transform: scale(1.2); } }
         .poll-count { font-size: 12px; color: var(--text-quaternary); margin-left: 4px; }
 
-        /* ===== 锁定/完成 状态 ===== */
         .locked-banner, .done-banner {
             background: rgba(255, 255, 255, 0.4);
             border-radius: var(--radius-sm);
@@ -227,7 +219,6 @@
         .done-banner .title { font-size: 20px; font-weight: 700; color: var(--success); }
         .locked-banner .desc, .done-banner .desc { color: var(--text-secondary); font-size: 14px; margin-top: 6px; }
 
-        /* ===== 底部显眼联系方式 ===== */
         .contact-footer {
             margin-top: 24px;
             padding: 14px 16px;
@@ -249,7 +240,6 @@
         }
         .contact-footer:hover { background: rgba(0, 122, 255, 0.15); }
 
-        /* ===== 辅助 ===== */
         .text-tertiary { color: var(--text-tertiary); font-size: 14px; position: relative; z-index: 1; }
         .text-quaternary { color: var(--text-quaternary); font-size: 13px; position: relative; z-index: 1; }
     </style>
@@ -257,7 +247,6 @@
 <body>
 
     <div class="container" id="mainContainer">
-        <!-- 无订单号 -->
         <div id="noOrderView">
             <div class="header">
                 <div class="logo"><span class="emoji">⚡</span> 自动发货</div>
@@ -267,14 +256,12 @@
             <p class="text-tertiary" style="margin-top: 16px;">链接由卖家创建，每个链接仅可使用一次</p>
         </div>
 
-        <!-- 有订单号 -->
         <div id="orderView" class="hidden">
             <div class="header">
                 <div class="logo"><span class="emoji">📱</span> 获取验证码</div>
                 <div class="order-id" id="orderIdDisplay"></div>
             </div>
 
-            <!-- 🔒 订单已被释放 - 锁定状态 -->
             <div id="lockedBox" class="hidden">
                 <div class="locked-banner">
                     <span class="icon">🔒</span>
@@ -284,10 +271,8 @@
                 <button class="btn btn-secondary" onclick="location.reload()">🔄 刷新页面</button>
             </div>
 
-            <!-- 状态栏 -->
             <div id="statusBox"></div>
 
-            <!-- 初始状态 -->
             <div id="initBox">
                 <div style="background: rgba(255, 59, 48, 0.1); border: 1.5px solid rgba(255, 59, 48, 0.25); border-radius: var(--radius-sm); padding: 16px 14px; margin-bottom: 24px; text-align: center; backdrop-filter: blur(10px); box-shadow: inset 0 1px 1px rgba(255,255,255,0.6); position: relative; z-index: 1;">
                     <div style="color: var(--danger); font-weight: 700; font-size: 15px; line-height: 1.6; letter-spacing: 0.5px;">
@@ -299,10 +284,9 @@
                 <button class="btn btn-primary" onclick="getPhone()" id="getPhoneBtn" style="font-size: 15px; padding: 15px 10px;">
                     我已知晓以上说明，获取手机号
                 </button>
-                <p class="text-tertiary" style="margin-top: 16px;">点击后获取手机号，有效期 120 秒</p>
+                <p class="text-tertiary" style="margin-top: 16px;">点击后获取手机号，有效期 90 秒</p>
             </div>
 
-            <!-- 活跃状态（获取手机号后） -->
             <div id="phoneBox" class="hidden">
                 <div class="info-card">
                     <div class="label">手机号码</div>
@@ -310,10 +294,11 @@
                 </div>
                 <button class="btn-copy" onclick="copyPhone()">复制手机号</button>
 
-                <!-- 警告提示 -->
                 <div style="margin-top: 18px; padding: 16px 12px; background: rgba(255, 59, 48, 0.1); border: 1.5px solid rgba(255, 59, 48, 0.25); border-radius: var(--radius-sm); text-align: center; backdrop-filter: blur(10px); box-shadow: inset 0 1px 1px rgba(255,255,255,0.6); position: relative; z-index: 1;">
                     <span style="color: var(--danger); font-weight: 700; font-size: 16px; line-height: 1.6; display: inline-block;">
-                        没收到验证码不要在迅游客户端二次获取验证码<br>否则验证失败不退不换
+                        耐心等待接收验证码<br>
+                        不要二次获取验证码，超时可以释放号码换号<br>
+                        二次获取验证导致验证失败不售后
                     </span>
                 </div>
 
@@ -323,7 +308,7 @@
                     </span>
                 </div>
 
-                <div id="countdownDisplay" class="hidden"></div>
+                <div id="countdownDisplay" class="hidden">90s</div>
 
                 <div class="polling-indicator" id="pollingIndicator">
                     <span class="polling-dot"></span>
@@ -333,17 +318,16 @@
                 <p class="text-quaternary" style="margin-top: 8px;">自动检测中，收到验证码将自动显示</p>
 
                 <button class="btn btn-secondary" onclick="releasePhone()" id="releaseBtn" disabled style="margin-top: 20px;">
-                    释放手机号，重新获取（120秒后可操作）
+                    释放手机号，重新获取（90秒后可操作）
                 </button>
             </div>
 
-            <!-- 超时状态 -->
             <div id="timeoutBox" class="hidden">
-                <div class="status-text status-warning">⏰ 验证码等待超时</div>
+                <div class="status-text status-warning">⏰ 手机号已过期（90秒未收到验证码）</div>
+                <p class="text-tertiary" style="margin-top: 8px;">号码已自动释放，请重新获取新号码</p>
                 <button class="btn btn-primary" onclick="getPhone()" id="getPhoneBtnTimeout" style="margin-top: 16px;">重新获取手机号</button>
             </div>
 
-            <!-- 完成状态（收到验证码） -->
             <div id="doneBox" class="hidden">
                 <div class="done-banner">
                     <span class="icon">✅</span>
@@ -361,14 +345,12 @@
                 <p class="text-tertiary" style="margin-top: 20px; color: var(--danger);">🔒 此订单已完成，链接永久失效。</p>
             </div>
 
-            <!-- 错误状态 -->
             <div id="errorBox" class="hidden">
                 <div class="status-text status-error" id="errorMessage"></div>
                 <button class="btn btn-secondary" onclick="location.reload()" style="margin-top: 16px;">🔄 重试</button>
             </div>
         </div>
 
-        <!-- 联系方式 -->
         <div class="contact-footer" onclick="copyWx()" title="点击复制微信号">
             购买加速器账号可直接联系V：1113630283
         </div>
@@ -378,8 +360,8 @@
         (function() {
             'use strict';
 
-            const API_BASE = 'https://order-api-9ch.pages.dev/api/order';
-            const TIMEOUT_SEC = 120;
+            const API_BASE = '/api/order';
+            const TIMEOUT_SEC = 90;
             const POLL_INTERVAL = 4000;
             const MAX_RETRIES = 30;
 
@@ -391,6 +373,7 @@
             let isOrderDone = false;
             let isGettingPhone = false;
             let isOrderLocked = false;
+            let isOrderExpired = false;
             let pureCode = '';
             let pollAttempts = 0;
 
@@ -476,7 +459,7 @@
             };
 
             async function apiCall(action, params = {}) {
-                const url = new URL(API_BASE);
+                const url = new URL(API_BASE, location.origin);
                 url.searchParams.set('action', action);
                 url.searchParams.set('oid', currentOid);
                 url.searchParams.set('sid', currentSid);
@@ -496,7 +479,7 @@
                 if (!currentOid) return false;
                 try {
                     const data = await apiCall('status');
-                    if (data.status === 'released' || data.status === 'invalid' || (!data.phone && data.status !== 'new')) {
+                    if (data.status === 'released' || data.status === 'invalid') {
                         return true;
                     }
                     return false;
@@ -519,47 +502,83 @@
                 if (pollingIndicator) { pollingIndicator.style.display = 'none'; }
             }
 
+            function updatePollIndicator() {
+                if (pollingIndicator) {
+                    pollingIndicator.style.display = 'flex';
+                    pollCount.textContent = `(${pollAttempts} 次)`;
+                }
+            }
+
+            function handleGotCode(phone, code) {
+                isOrderDone = true;
+                disableAllButtons();
+                stopAllTimers();
+                if (phone) {
+                    currentPhone = phone;
+                    phoneDisplayDone.textContent = phone;
+                }
+                pureCode = extractNumbers(code);
+                codeDisplay.textContent = code;
+                showUI('done');
+                setStatus('验证码已收到', 'success');
+            }
+
+            function handleExpired() {
+                isOrderExpired = true;
+                stopAllTimers();
+                enableGetButtons();
+                showUI('timeout');
+                setStatus('手机号已过期，可重新获取', 'warning');
+            }
+
             function startPolling() {
                 stopPolling();
                 pollAttempts = 0;
                 updatePollIndicator();
 
                 pollingTimer = setInterval(async () => {
-                    if (isOrderDone || isOrderLocked) { stopAllTimers(); return; }
+                    if (isOrderDone || isOrderLocked || isOrderExpired) { stopAllTimers(); return; }
 
                     pollAttempts++;
                     updatePollIndicator();
 
                     try {
-                        const locked = await checkOrderLocked();
-                        if (locked) {
+                        const statusData = await apiCall('status');
+
+                        if (statusData.status === 'expired') {
+                            handleExpired();
+                            return;
+                        }
+
+                        if (statusData.status === 'released' || statusData.status === 'invalid') {
                             isOrderLocked = true;
                             stopAllTimers();
                             showUI('locked');
                             return;
                         }
 
-                        const data = await apiCall('getSMS');
+                        if (statusData.status === 'done' && statusData.code) {
+                            handleGotCode(statusData.phone, statusData.code);
+                            return;
+                        }
 
-                        if (data.code && data.status === 'done') {
-                            const digits = extractNumbers(data.code);
-                            if (digits.length >= 4) {
-                                isOrderDone = true;
-                                disableAllButtons();
-                                stopAllTimers();
+                        if (statusData.status === 'active') {
+                            const sms = await apiCall('getSMS');
 
-                                currentPhone = data.phone || currentPhone;
-                                phoneDisplayDone.textContent = currentPhone;
-                                pureCode = digits;
-                                codeDisplay.textContent = data.code;
-                                showUI('done');
-                                setStatus('验证码已收到', 'success');
+                            if (sms.status === 'expired') {
+                                handleExpired();
+                                return;
+                            }
+                            if (sms.status === 'done' && sms.code) {
+                                handleGotCode(statusData.phone, sms.code);
                                 return;
                             }
                         }
 
                         if (pollAttempts >= MAX_RETRIES) {
                             stopAllTimers();
+                            enableGetButtons();
+                            showUI('timeout');
                             setStatus('验证码等待超时，请尝试重新获取', 'warning');
                         }
 
@@ -576,46 +595,27 @@
                 }, POLL_INTERVAL);
             }
 
-            function updatePollIndicator() {
-                if (pollingIndicator) {
-                    pollingIndicator.style.display = 'flex';
-                    pollCount.textContent = `(${pollAttempts} 次)`;
-                }
-            }
-
             window.getPhone = async function() {
                 if (isOrderDone || isGettingPhone || isOrderLocked) return;
 
-                setStatus('检查订单状态...', 'info');
-                const locked = await checkOrderLocked();
-                if (locked) {
-                    isOrderLocked = true;
-                    stopAllTimers();
-                    showUI('locked');
-                    return;
-                }
-
+                isOrderExpired = false;
                 isGettingPhone = true;
                 disableAllButtons();
                 showUI('active');
                 phoneDisplay.textContent = '获取中...';
+                setStatus('正在获取手机号...', 'info');
 
                 try {
                     const data = await apiCall('getPhone');
+
                     if (data.status === 'done') {
-                        isOrderDone = true;
-                        currentPhone = data.phone;
-                        phoneDisplayDone.textContent = data.phone;
-                        pureCode = extractNumbers(data.code || '');
-                        codeDisplay.textContent = data.code;
-                        showUI('done');
-                        setStatus('验证码已收到', 'success');
+                        handleGotCode(data.phone, data.code);
                         return;
                     }
+
                     currentPhone = data.phone;
                     phoneDisplay.textContent = data.phone;
                     startCountdown(data.expire);
-                    showUI('active');
                     setStatus('手机号已获取，正在等待验证码...', 'info');
                     startPolling();
                 } catch (e) {
@@ -636,7 +636,7 @@
             function startCountdown(expireTs) {
                 if (countdownTimer) clearInterval(countdownTimer);
                 const update = () => {
-                    if (isOrderLocked) { clearInterval(countdownTimer); return; }
+                    if (isOrderLocked || isOrderExpired) { clearInterval(countdownTimer); return; }
                     const remain = Math.max(0, Math.ceil((expireTs - Date.now()) / 1000));
                     countdownDisplay.textContent = remain + 's';
                     if (remain > 0) {
@@ -647,7 +647,7 @@
                         countdownTimer = null;
                         releaseBtn.disabled = false;
                         releaseBtn.textContent = '释放手机号，重新获取';
-                        setStatus('已超时，可继续等待或手动释放', 'warning');
+                        setStatus('号码即将释放，可稍候自动换新号', 'warning');
                     }
                 };
                 update();
@@ -660,6 +660,7 @@
                 try {
                     await apiCall('release');
                     currentPhone = null;
+                    isOrderExpired = false;
                     stopAllTimers();
                     enableGetButtons();
                     showUI('init');
@@ -672,29 +673,35 @@
             async function checkOrder() {
                 if (!currentOid) return;
                 try {
-                    const locked = await checkOrderLocked();
-                    if (locked) {
+                    const data = await apiCall('status');
+
+                    if (data.status === 'invalid' || data.status === 'released') {
                         isOrderLocked = true;
                         stopAllTimers();
                         showUI('locked');
                         return;
                     }
 
-                    const data = await apiCall('status');
-                    if (data.status === 'done') {
-                        if (data.code && extractNumbers(data.code).length >= 4) {
-                            isOrderDone = true;
-                            disableAllButtons();
-                            currentPhone = data.phone;
-                            phoneDisplayDone.textContent = data.phone;
-                            pureCode = extractNumbers(data.code);
-                            codeDisplay.textContent = data.code;
-                            showUI('done');
-                            setStatus('验证码已收到', 'success');
-                        }
+                    if (data.status === 'expired') {
+                        enableGetButtons();
+                        showUI('timeout');
+                        setStatus('手机号已过期，可重新获取', 'warning');
                         return;
                     }
-                    if (data.status === 'active' && data.phone) {
+
+                    if (data.status === 'done' && data.code && extractNumbers(data.code).length >= 4) {
+                        isOrderDone = true;
+                        disableAllButtons();
+                        currentPhone = data.phone;
+                        phoneDisplayDone.textContent = data.phone;
+                        pureCode = extractNumbers(data.code);
+                        codeDisplay.textContent = data.code;
+                        showUI('done');
+                        setStatus('验证码已收到', 'success');
+                        return;
+                    }
+
+                    if (data.status === 'active' && data.phone && data.expire && Date.now() < data.expire) {
                         isOrderDone = false;
                         disableAllButtons();
                         currentPhone = data.phone;
@@ -705,6 +712,7 @@
                         startPolling();
                         return;
                     }
+
                     showUI('init');
                     enableGetButtons();
                 } catch (e) {
@@ -719,10 +727,24 @@
                 }
             }
 
+            // ============================================================
+            // 【修改】初始化：优先从路径读取订单号 /HZxxxxx，兼容旧 ?oid=
+            // ============================================================
             (function init() {
+                let oid = null;
+
+                // 1) 优先从路径读取：https://xxx/HZxxxxx
+                const pathOid = location.pathname.replace(/^\/+|\/+$/g, '');
+                if (/^HZ[A-Z0-9]+$/i.test(pathOid)) {
+                    oid = pathOid;
+                }
+
+                // 2) 兼容旧链接：/?oid=HZxxxxx
                 const params = new URLSearchParams(location.search);
-                const oid = params.get('oid');
+                if (!oid) oid = params.get('oid');
+
                 const sid = params.get('sid');
+
                 if (!oid) return;
                 if (sid) currentSid = sid;
                 currentOid = oid;
