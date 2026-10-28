@@ -1,1171 +1,854 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
-    <title>自动发货 - 获取手机号</title>
-    <style>
-        :root {
-            --bg-gradient: linear-gradient(135deg, #e8f0fe 0%, #fde8f0 50%, #e2f0ff 100%);
-            --card-bg: rgba(255, 255, 255, 0.65);
-            --card-border: 1px solid rgba(255, 255, 255, 0.8);
-            --card-shadow: 0 8px 32px rgba(0, 0, 0, 0.06), 0 2px 8px rgba(0, 0, 0, 0.02);
-            --primary: #007AFF;
-            --primary-hover: #0066D9;
-            --danger: #FF3B30;
-            --danger-hover: #E0352B;
-            --success: #34C759;
-            --warning: #FF9500;
-            --text-primary: #1C1C1E;
-            --text-secondary: #3A3A3C;
-            --text-tertiary: #8E8E93;
-            --text-quaternary: #AEAEB2;
-            --separator: rgba(229, 229, 234, 0.6);
-            --input-bg: rgba(242, 242, 247, 0.7);
-            --radius: 24px;
-            --radius-sm: 16px;
-            --radius-xs: 12px;
-            --font: -apple-system, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', 'PingFang SC', 'Microsoft YaHei', sans-serif;
-            --transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+// ============ 全局常量 ============
+const PHONE_TTL_MS = 180 * 1000;             // 手机号有效期：180 秒
+const ACTIVE_INDEX_KEY = '__active_orders__'; // 活跃订单索引键
+const ORDER_INDEX_KEY  = '__order_index__';   // 订单列表索引键
+const ORDER_INDEX_VERSION = 2;                // v2：只收录已完成（收到验证码）的订单
+
+// ============ 带超时的 fetch ============
+async function fetchWithTimeout(url, options = {}, timeout = 4000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    throw new Error('接码平台请求超时或被中断');
+  }
+}
+
+export async function onRequest(context) {
+  const { request, env } = context;
+  const url = new URL(request.url);
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+      }
+    });
+  }
+
+  const action = url.searchParams.get('action');
+  const oid = url.searchParams.get('oid');
+
+  try {
+    const kv = env.ORDERS;
+    if (!kv) throw new Error('严重错误：后端 KV 数据库 (ORDERS) 未绑定');
+
+    const POOL_KEY = 'phone_pool';
+    const LOG_KEY  = 'phone_logs';
+    const CARD_KEY = 'card_keys';
+
+    const apiCfg = await kv.get('__api_config__', { type: 'json' }) || {};
+    const apiUser = apiCfg.user || '';
+    const apiPass = apiCfg.pass || '';
+    const sid = url.searchParams.get('sid') || apiCfg.sid || '24085';
+
+    const poolActions = [
+      'addPhone', 'removePhone', 'poolList', 'resetPool', 'releasePoolPhone', 'logList',
+      'getBalance', 'lockOrder', 'blockPhone',
+      'generateCard', 'activateCard', 'verifyCard', 'cardList', 'deleteCard',
+      'createOrder', 'listActiveOrders', 'listAllOrders', 'releaseAllOrders',
+      'cancelRecvPhone', 'saveApiConfig', 'getApiConfig', 'rebuildOrderIndex'
+    ];
+    if (!oid && !poolActions.includes(action)) {
+      return jsonResponse({ error: '缺少订单ID' }, 400);
+    }
+
+    const HAOZHU = { server: 'api.haozhuma.com', user: apiUser, pass: apiPass, sid };
+
+    async function getPool() { const p = await kv.get(POOL_KEY, { type: 'json' }); return p || []; }
+    async function savePool(pool) { await kv.put(POOL_KEY, JSON.stringify(pool)); }
+
+    async function getLogs() { const l = await kv.get(LOG_KEY, { type: 'json' }); return l || []; }
+    async function saveLogs(logs) {
+      if (logs.length > 100) logs = logs.slice(-100);
+      await kv.put(LOG_KEY, JSON.stringify(logs));
+    }
+
+    // ============================================================
+    // ★【改动点 1】addLog 已改为空操作
+    // 说明：原来每次收到验证码会写一次 logs（+1 次 KV 写），
+    //      免费版每天只有 1000 次写入，日志价值低，直接禁用。
+    //      如需恢复：删掉下面整个函数体里的 return，并取消 getSMS 里的调用注释。
+    // ============================================================
+    async function addLog(phone, oid, action) {
+      return;
+    }
+
+    async function getCards() { const c = await kv.get(CARD_KEY, { type: 'json' }); return c || []; }
+    async function saveCards(cards) { await kv.put(CARD_KEY, JSON.stringify(cards)); }
+
+    // ============ 活跃订单索引 ============
+    async function updateActiveIndex(oid, phone, expire) {
+      let index = await kv.get(ACTIVE_INDEX_KEY, { type: 'json' }) || {};
+      index[oid] = { oid, phone, expire };
+      await kv.put(ACTIVE_INDEX_KEY, JSON.stringify(index));
+    }
+    async function removeFromActiveIndex(oid) {
+      let index = await kv.get(ACTIVE_INDEX_KEY, { type: 'json' }) || {};
+      if (index[oid]) { delete index[oid]; await kv.put(ACTIVE_INDEX_KEY, JSON.stringify(index)); }
+    }
+
+    // ============ 订单索引：只收录已完成订单 ============
+    async function buildOrderIndexFromList() {
+      console.log('[order-index] 开始构建索引（仅已完成订单）...');
+      const collected = [];
+      let listCursor = null;
+      let pages = 0;
+
+      do {
+        const res = await kv.list({ limit: 1000, cursor: listCursor });
+        for (const k of res.keys) {
+          if (k.name.startsWith('__')) continue;
+          if (k.name === POOL_KEY || k.name === LOG_KEY || k.name === CARD_KEY) continue;
+
+          const md = k.metadata || {};
+          const status = md.status;
+          const createdAt = typeof md.createdAt === 'number' ? md.createdAt : 0;
+
+          if (status !== undefined && status !== null && status !== 'done') continue;
+
+          collected.push({ oid: k.name, createdAt });
+        }
+        listCursor = res.list_complete ? null : res.cursor;
+        pages++;
+        if (pages > 100) {
+          console.warn('[order-index] 达到 100 页上限，停止扫描');
+          break;
+        }
+      } while (listCursor);
+
+      collected.sort((a, b) => {
+        if (b.createdAt !== a.createdAt) return b.createdAt - a.createdAt;
+        return String(b.oid).localeCompare(String(a.oid), undefined, { numeric: true });
+      });
+
+      await kv.put(ORDER_INDEX_KEY, JSON.stringify({
+        version: ORDER_INDEX_VERSION,
+        items: collected
+      }));
+      console.log(`[order-index] 构建完成，共 ${collected.length} 条`);
+      return collected;
+    }
+
+    // ============================================================
+    // ★【改动点 2】getOrderIndex 不再自动 rebuild
+    // 说明：原来索引不存在时会自动全量 kv.list 扫描 + put（很贵），
+    //      现在改成返回空数组，只有手动调 rebuildOrderIndex 才重建。
+    //      效果：新订单不会自动出现在 listAllOrders，需管理员手动重建。
+    // ============================================================
+    async function getOrderIndex() {
+      const stored = await kv.get(ORDER_INDEX_KEY, { type: 'json' });
+      if (stored && stored.version === ORDER_INDEX_VERSION && Array.isArray(stored.items)) {
+        return stored.items;
+      }
+      return [];
+    }
+
+    async function pushToOrderIndex(oid, createdAt) {
+      const items = await getOrderIndex();
+      const filtered = items.filter(it => it.oid !== oid);
+      filtered.unshift({ oid, createdAt: createdAt || Date.now() });
+      if (filtered.length > 20000) filtered.length = 20000;
+      await kv.put(ORDER_INDEX_KEY, JSON.stringify({
+        version: ORDER_INDEX_VERSION,
+        items: filtered
+      }));
+    }
+
+    async function removeFromOrderIndex(oid) {
+      const stored = await kv.get(ORDER_INDEX_KEY, { type: 'json' });
+      if (!stored || !Array.isArray(stored.items)) return;
+      const filtered = stored.items.filter(it => it.oid !== oid);
+      if (filtered.length !== stored.items.length) {
+        await kv.put(ORDER_INDEX_KEY, JSON.stringify({
+          version: ORDER_INDEX_VERSION,
+          items: filtered
+        }));
+      }
+    }
+
+    function generateCardKey() {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      const segment = () => {
+        let s = '';
+        for (let i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
+        return s;
+      };
+      return `HZ-${segment()}-${segment()}`;
+    }
+
+    async function getValidToken() {
+      if (!HAOZHU.user || !HAOZHU.pass) throw new Error('未配置接码平台账号密码');
+
+      const tokenData = await kv.get('__token_data__', { type: 'json' });
+      let tokenStr = tokenData ? tokenData.token : null;
+      let tokenExpiry = tokenData ? tokenData.expire : 0;
+      const tokenApiUser = tokenData ? tokenData.apiUser : null;
+      const tokenApiPass = tokenData ? tokenData.apiPass : null;
+
+      const needLogin = !tokenStr || Date.now() >= tokenExpiry - 300000
+        || tokenApiUser !== HAOZHU.user || tokenApiPass !== HAOZHU.pass;
+
+      if (needLogin) {
+        const loginResp = await fetchWithTimeout(
+          `https://${HAOZHU.server}/sms/?api=login&user=${HAOZHU.user}&pass=${HAOZHU.pass}`
+        );
+        const loginData = await loginResp.json();
+        if (loginData.code == 0) {
+          tokenStr = loginData.token || loginData.Token || loginData.access_token;
+          tokenExpiry = Date.now() + 3500000;
+          await kv.put('__token_data__', JSON.stringify({
+            token: tokenStr, expire: tokenExpiry, apiUser: HAOZHU.user, apiPass: HAOZHU.pass
+          }));
+        } else {
+          throw new Error('接码平台登录失败：' + (loginData.msg || ''));
+        }
+      }
+      return tokenStr;
+    }
+
+    async function releaseOrderPhone(order, oid) {
+      if (!order || !order.phone) return;
+      if (order.fromPool) {
+        const pool = await getPool();
+        const entry = pool.find(p => p.phone === order.phone);
+        if (entry && entry.status === 'in_use') {
+          entry.status = 'available'; entry.oid = null; entry.expire = null;
+          await savePool(pool);
+        }
+      } else {
+        try {
+          const tokenStr = await getValidToken();
+          const orderSid = order.sid || HAOZHU.sid;
+          await fetchWithTimeout(`https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`);
+        } catch (e) { console.error('释放号码失败:', e); }
+      }
+      if (oid) await removeFromActiveIndex(oid);
+    }
+
+    async function releaseOrderByOid(oid) {
+      const order = await kv.get(oid, { type: 'json' });
+      if (!order) return { success: false, error: '订单不存在' };
+      if (order.status === 'done') return { success: false, error: '订单已完成，无法释放' };
+      if (order.status === 'released') return { success: false, error: '订单已被释放过' };
+
+      await releaseOrderPhone(order, oid);
+      order.status = 'released'; order.phone = null; order.expire = null; order.code = null;
+      await kv.put(oid, JSON.stringify(order), {
+        metadata: { createdAt: order.createdAt || 0, status: 'released' }
+      });
+      return { success: true };
+    }
+
+    // ====== 业务分发 ======
+    switch (action) {
+      case 'getApiConfig': {
+        const cfg = await kv.get('__api_config__', { type: 'json' }) || {};
+        return jsonResponse({
+          success: true,
+          apiUser: cfg.user || '',
+          apiPass: cfg.pass || '',
+          sid: cfg.sid || '24085',
+          ascription: cfg.ascription || '',
+          paragraph: cfg.paragraph || '',
+          exclude: cfg.exclude || '',
+          uid: cfg.uid || ''
+        });
+      }
+
+      case 'saveApiConfig': {
+        const newUser = url.searchParams.get('apiUser');
+        const newPass = url.searchParams.get('apiPass');
+        const newSid  = url.searchParams.get('sid');
+        const newAscription = url.searchParams.get('ascription') || '';
+        const newParagraph = url.searchParams.get('paragraph') || '';
+        const newExclude = url.searchParams.get('exclude') || '';
+        const newUid = url.searchParams.get('uid') || '';
+
+        const existing = await kv.get('__api_config__', { type: 'json' }) || {};
+
+        let finalUser = existing.user || '';
+        let finalPass = existing.pass || '';
+
+        if (newUser && newPass) {
+          finalUser = newUser;
+          finalPass = newPass;
+        } else if (newUser || newPass) {
+          return jsonResponse({ error: '账号和密码必须同时提供' }, 400);
+        } else {
+          if (!finalUser || !finalPass) {
+            return jsonResponse({ error: '首次配置需要提供账号和密码' }, 400);
+          }
         }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        const newConfig = {
+          user: finalUser,
+          pass: finalPass,
+          sid: newSid || existing.sid || '24085',
+          ascription: newAscription,
+          paragraph: newParagraph,
+          exclude: newExclude,
+          uid: newUid
+        };
 
-        body {
-            font-family: var(--font);
-            background: var(--bg-gradient);
-            background-attachment: fixed;
-            color: var(--text-primary);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 24px 16px;
-            -webkit-font-smoothing: antialiased;
+        await kv.put('__api_config__', JSON.stringify(newConfig));
+
+        if (finalUser !== existing.user || finalPass !== existing.pass) {
+          await kv.delete('__token_data__');
         }
 
-        .hidden { display: none !important; }
+        return jsonResponse({ success: true });
+      }
 
-        .container {
-            width: 100%;
-            max-width: 420px;
-            background: var(--card-bg);
-            backdrop-filter: blur(24px);
-            -webkit-backdrop-filter: blur(24px);
-            border: var(--card-border);
-            border-radius: var(--radius);
-            box-shadow: var(--card-shadow);
-            padding: 32px 24px;
-            text-align: center;
-            transition: box-shadow var(--transition);
-        }
+      case 'cancelRecvPhone': {
+        const phone = url.searchParams.get('phone');
+        if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+        try {
+          const tokenStr = await getValidToken();
+          const cancelUrl = `https://${HAOZHU.server}/sms/?api=cancelRecv&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${encodeURIComponent(phone)}`;
+          const cancelResp = await fetchWithTimeout(cancelUrl);
+          const cancelData = await cancelResp.json();
 
-        .header { margin-bottom: 24px; }
-        .header .logo {
-            font-size: 28px;
-            font-weight: 700;
-            letter-spacing: -0.5px;
-            color: var(--text-primary);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }
-        .header .logo .emoji { font-size: 32px; }
-        .header .subtitle { color: var(--text-tertiary); font-size: 15px; margin-top: 4px; font-weight: 400; }
-        .header .order-id { font-size: 13px; color: var(--text-quaternary); margin-top: 6px; font-weight: 400; letter-spacing: 0.5px; }
-
-        .btn {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            width: 100%;
-            padding: 14px 20px;
-            border: none;
-            border-radius: 999px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all var(--transition);
-            font-family: var(--font);
-            letter-spacing: 0.3px;
-            min-height: 50px;
-            white-space: normal;
-            line-height: 1.3;
-        }
-        .btn:active { transform: scale(0.96); }
-        .btn-primary {
-            background: linear-gradient(135deg, var(--primary), #0056b3);
-            color: #fff;
-            box-shadow: 0 4px 15px rgba(0, 122, 255, 0.3);
-        }
-        .btn-primary:hover { background: linear-gradient(135deg, var(--primary-hover), #004a99); box-shadow: 0 6px 20px rgba(0, 122, 255, 0.4); }
-        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
-
-        .btn-secondary {
-            background: var(--input-bg);
-            color: var(--primary);
-            border: 1px solid var(--separator);
-            box-shadow: none;
-        }
-        .btn-secondary:hover { background: #E8E8ED; }
-        .btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-
-        .btn-copy {
-            background: transparent;
-            border: 1px dashed rgba(0, 122, 255, 0.4);
-            color: var(--primary);
-            padding: 10px 20px;
-            border-radius: 999px;
-            font-size: 14px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all var(--transition);
-            font-family: var(--font);
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            margin-top: 10px;
-        }
-        .btn-copy:hover { border-color: var(--primary); background: rgba(0, 122, 255, 0.04); }
-
-        .info-card {
-            background: rgba(255, 255, 255, 0.5);
-            border-radius: var(--radius-sm);
-            padding: 20px 16px;
-            margin: 16px 0;
-            border: 1px solid rgba(255, 255, 255, 0.9);
-            box-shadow: inset 0 1px 2px rgba(0,0,0,0.01);
-        }
-        .info-card .label { color: var(--text-tertiary); font-size: 13px; font-weight: 500; margin-bottom: 8px; }
-        .phone-number { font-size: 28px; font-weight: 600; letter-spacing: 2px; color: var(--text-primary); user-select: all; }
-        .code-number { font-size: 36px; font-weight: 700; letter-spacing: 6px; color: var(--primary); padding: 8px 0; user-select: all; font-family: 'SF Mono', 'Consolas', monospace; }
-
-        .status-text {
-            font-weight: 500;
-            padding: 14px 16px;
-            border-radius: var(--radius-sm);
-            margin: 12px 0 16px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            font-size: 15px;
-            line-height: 1.5;
-            backdrop-filter: blur(10px);
-        }
-        .status-info { background: rgba(0, 122, 255, 0.08); border: 1px solid rgba(0, 122, 255, 0.15); color: var(--primary); }
-        .status-success { background: rgba(52, 199, 89, 0.1); border: 1px solid rgba(52, 199, 89, 0.2); color: #1D8B3C; }
-        .status-warning { background: rgba(255, 149, 0, 0.1); border: 1px solid rgba(255, 149, 0, 0.2); color: #B25900; }
-        .status-error { background: rgba(255, 59, 48, 0.1); border: 1px solid rgba(255, 59, 48, 0.2); color: var(--danger); }
-
-        .countdown { font-size: 18px; font-weight: 600; color: var(--warning); margin-top: 8px; }
-        .polling-indicator { display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-tertiary); font-size: 14px; margin-top: 16px; }
-        .polling-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); animation: pulse 1.5s ease-in-out infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(1); } 50% { opacity: 1; transform: scale(1.2); } }
-        .poll-count { font-size: 12px; color: var(--text-quaternary); margin-left: 4px; }
-
-        .locked-banner, .done-banner {
-            background: rgba(255, 255, 255, 0.5);
-            border-radius: var(--radius-sm);
-            padding: 28px 20px;
-            margin: 16px 0;
-            border: 1px solid rgba(255, 255, 255, 0.9);
-        }
-        .locked-banner .icon, .done-banner .icon { font-size: 44px; display: block; margin-bottom: 12px; }
-        .locked-banner .title { font-size: 20px; font-weight: 700; color: var(--danger); }
-        .done-banner .title { font-size: 20px; font-weight: 700; color: var(--success); }
-        .locked-banner .desc, .done-banner .desc { color: var(--text-secondary); font-size: 14px; margin-top: 6px; }
-
-        .contact-footer {
-            margin-top: 24px;
-            padding: 14px 16px;
-            background: rgba(0, 122, 255, 0.08);
-            border: 1.5px dashed rgba(0, 122, 255, 0.3);
-            border-radius: var(--radius-sm);
-            text-align: center;
-            color: var(--primary);
-            font-size: 15px;
-            font-weight: 600;
-            letter-spacing: 0.4px;
-            cursor: pointer;
-            user-select: all;
-            transition: all var(--transition);
-        }
-        .contact-footer:hover { background: rgba(0, 122, 255, 0.12); }
-
-        /* ===== 置顶教程大按钮 ===== */
-        .tutorial-banner {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            width: 100%;
-            padding: 20px 16px;
-            margin: 0 0 18px;
-            background: linear-gradient(135deg, rgba(0, 122, 255, 0.16), rgba(0, 122, 255, 0.06));
-            border: 2.5px dashed rgba(0, 122, 255, 0.55);
-            border-radius: var(--radius-sm);
-            color: var(--primary);
-            font-size: 21px;
-            font-weight: 800;
-            letter-spacing: 0.6px;
-            line-height: 1.3;
-            cursor: pointer;
-            user-select: none;
-            transition: all var(--transition);
-            animation: tutorialGlow 2s ease-in-out infinite;
-        }
-        .tutorial-banner:hover { background: linear-gradient(135deg, rgba(0, 122, 255, 0.24), rgba(0, 122, 255, 0.1)); border-color: var(--primary); }
-        .tutorial-banner:active { transform: scale(0.97); }
-        .tutorial-banner .tb-icon { font-size: 26px; flex-shrink: 0; }
-        .tutorial-banner .tb-arrow { font-size: 26px; font-weight: 400; line-height: 1; margin-left: 2px; }
-
-        @keyframes tutorialGlow {
-            0%, 100% { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.28); }
-            50%      { box-shadow: 0 0 0 9px rgba(0, 122, 255, 0); }
-        }
-
-        .text-tertiary { color: var(--text-tertiary); font-size: 14px; }
-        .text-quaternary { color: var(--text-quaternary); font-size: 13px; }
-
-        /* ===== 教程弹窗样式 ===== */
-        .tutorial-overlay {
-            position: fixed;
-            inset: 0;
-            background: rgba(0, 0, 0, 0.5);
-            backdrop-filter: blur(8px);
-            -webkit-backdrop-filter: blur(8px);
-            z-index: 1000;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px 16px;
-            overflow-y: auto;
-        }
-        .tutorial-modal {
-            width: 100%;
-            max-width: 460px;
-            max-height: 90vh;
-            overflow-y: auto;
-            background: #fff;
-            border-radius: var(--radius);
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
-            padding: 28px 20px 32px;
-            position: relative;
-            animation: modalIn 0.35s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        @keyframes modalIn {
-            from { opacity: 0; transform: scale(0.92) translateY(20px); }
-            to { opacity: 1; transform: scale(1) translateY(0); }
-        }
-        .tutorial-modal::-webkit-scrollbar { width: 4px; }
-        .tutorial-modal::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 4px; }
-
-        .tutorial-close {
-            position: absolute;
-            top: 16px;
-            right: 16px;
-            width: 36px;
-            height: 36px;
-            border-radius: 50%;
-            background: rgba(0, 0, 0, 0.06);
-            border: none;
-            font-size: 20px;
-            color: var(--text-secondary);
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: background 0.2s;
-            line-height: 1;
-            z-index: 10;
-        }
-        .tutorial-close:hover { background: rgba(0, 0, 0, 0.12); }
-
-        .tutorial-title {
-            font-size: 22px;
-            font-weight: 700;
-            text-align: center;
-            color: var(--text-primary);
-            margin-bottom: 6px;
-            letter-spacing: -0.3px;
-        }
-        .tutorial-subtitle {
-            text-align: center;
-            color: var(--text-tertiary);
-            font-size: 14px;
-            margin-bottom: 24px;
-        }
-
-        .tutorial-step {
-            margin-bottom: 28px;
-            background: #f8f9fc;
-            border-radius: var(--radius-sm);
-            padding: 16px;
-            border: 1px solid rgba(0, 0, 0, 0.04);
-        }
-        .tutorial-step:last-child { margin-bottom: 0; }
-
-        .tutorial-step-header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 12px;
-        }
-        .tutorial-step-num {
-            width: 30px;
-            height: 30px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, var(--primary), #0056b3);
-            color: #fff;
-            font-size: 15px;
-            font-weight: 700;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            flex-shrink: 0;
-            box-shadow: 0 3px 8px rgba(0, 122, 255, 0.3);
-        }
-        .tutorial-step-title {
-            font-size: 16px;
-            font-weight: 700;
-            color: var(--text-primary);
-        }
-
-        .tutorial-step-img {
-            width: 100%;
-            border-radius: var(--radius-xs);
-            border: 1px solid rgba(0, 0, 0, 0.06);
-            display: block;
-            margin-bottom: 12px;
-            background: #f0f0f5;
-            min-height: 80px;
-            object-fit: contain;
-        }
-
-        .tutorial-step-desc {
-            font-size: 14px;
-            color: var(--text-secondary);
-            line-height: 1.7;
-            padding-left: 2px;
-        }
-        .tutorial-step-desc strong {
-            color: var(--primary);
-            font-weight: 600;
-        }
-
-        .tutorial-tip {
-            margin-top: 24px;
-            padding: 14px 16px;
-            background: rgba(255, 149, 0, 0.08);
-            border: 1px solid rgba(255, 149, 0, 0.2);
-            border-radius: var(--radius-xs);
-            font-size: 13px;
-            color: #B25900;
-            line-height: 1.6;
-            text-align: center;
-        }
-
-        .tutorial-footer-btn {
-            margin-top: 24px;
-        }
-
-        /* ===== 已完成：紧凑手机号 + 验证码 ===== */
-        .compact-card {
-            background: rgba(255, 255, 255, 0.55);
-            border-radius: var(--radius-sm);
-            padding: 14px 12px;
-            margin: 12px 0;
-            border: 1px solid rgba(255, 255, 255, 0.9);
-            box-shadow: inset 0 1px 2px rgba(0,0,0,0.01);
-        }
-        .compact-row {
-            display: flex;
-            gap: 10px;
-        }
-        .compact-col {
-            flex: 1;
-            min-width: 0;
-            background: rgba(242, 242, 247, 0.75);
-            border-radius: var(--radius-xs);
-            padding: 10px 8px;
-            text-align: center;
-        }
-        .compact-col .label {
-            color: var(--text-tertiary);
-            font-size: 12px;
-            font-weight: 500;
-            margin-bottom: 4px;
-        }
-        .compact-phone {
-            font-size: 16px;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-            color: var(--text-primary);
-            user-select: all;
-            word-break: break-all;
-        }
-        .compact-code {
-            font-size: 20px;
-            font-weight: 700;
-            letter-spacing: 2px;
-            color: var(--primary);
-            user-select: all;
-            font-family: 'SF Mono', 'Consolas', monospace;
-            word-break: break-all;
-        }
-        .compact-copy-row {
-            display: flex;
-            gap: 8px;
-            margin-top: 10px;
-        }
-        .compact-copy-row .btn-copy {
-            flex: 1;
-            margin-top: 0;
-            justify-content: center;
-            padding: 8px 10px;
-            font-size: 13px;
-        }
-
-        /* ===== 已完成：口令兑换区 ===== */
-        .codes-card {
-            background: rgba(255, 255, 255, 0.6);
-            border: 1px solid rgba(255, 255, 255, 0.9);
-            border-radius: var(--radius-sm);
-            padding: 16px 14px;
-            margin: 14px 0;
-            text-align: left;
-        }
-        .codes-header {
-            font-size: 15px;
-            font-weight: 700;
-            color: var(--text-primary);
-            text-align: center;
-            margin-bottom: 12px;
-        }
-        .code-item {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            background: linear-gradient(135deg, rgba(0, 122, 255, 0.06), rgba(0, 122, 255, 0.02));
-            border: 1px solid rgba(0, 122, 255, 0.15);
-            border-radius: var(--radius-xs);
-            padding: 10px 12px;
-            margin-bottom: 8px;
-        }
-        .code-item:last-of-type { margin-bottom: 0; }
-        .code-item-label {
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text-tertiary);
-            flex-shrink: 0;
-        }
-        .code-item-value {
-            flex: 1;
-            min-width: 0;
-            font-family: 'SF Mono', 'Consolas', monospace;
-            font-size: 16px;
-            font-weight: 700;
-            color: var(--primary);
-            letter-spacing: 0.5px;
-            user-select: all;
-            word-break: break-all;
-        }
-        .code-copy-btn {
-            flex-shrink: 0;
-            background: var(--primary);
-            color: #fff;
-            border: none;
-            border-radius: 999px;
-            padding: 7px 14px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            font-family: var(--font);
-            transition: all var(--transition);
-        }
-        .code-copy-btn:hover { background: var(--primary-hover); }
-        .code-copy-btn:active { transform: scale(0.95); }
-        .code-copy-btn.copied { background: var(--success); }
-        .codes-note {
-            margin-top: 12px;
-            padding: 10px 12px;
-            background: rgba(255, 59, 48, 0.08);
-            border: 1px solid rgba(255, 59, 48, 0.2);
-            border-radius: var(--radius-xs);
-            font-size: 12.5px;
-            color: var(--danger);
-            font-weight: 600;
-            line-height: 1.5;
-            text-align: center;
-        }
-
-        @media (max-width: 480px) {
-            .tutorial-modal { padding: 24px 16px 28px; max-height: 95vh; border-radius: 20px; }
-            .tutorial-title { font-size: 20px; }
-            .tutorial-step { padding: 14px; }
-            .tutorial-step-title { font-size: 15px; }
-            .tutorial-step-desc { font-size: 13px; }
-            .tutorial-banner { font-size: 19px; padding: 18px 12px; }
-            .tutorial-banner .tb-icon { font-size: 23px; }
-            .compact-phone { font-size: 15px; }
-            .compact-code { font-size: 18px; letter-spacing: 1.5px; }
-        }
-    </style>
-</head>
-<body>
-
-    <div class="container" id="mainContainer">
-        <!-- 无订单号 -->
-        <div id="noOrderView">
-            <div class="header">
-                <div class="logo"><span class="emoji">⚡</span> 自动发货</div>
-                <div class="subtitle">游戏加速器会员</div>
-            </div>
-            <div class="status-text status-warning" style="margin-top: 20px;">⚠️ 请使用卖家提供的专属链接访问</div>
-            <p class="text-tertiary" style="margin-top: 16px;">链接由卖家创建，每个链接仅可使用一次</p>
-        </div>
-
-        <!-- 有订单号 -->
-        <div id="orderView" class="hidden">
-            <div class="header">
-                <div class="logo"><span class="emoji">📱</span> 获取验证码</div>
-                <div class="order-id" id="orderIdDisplay"></div>
-            </div>
-
-            <div id="lockedBox" class="hidden">
-                <div class="locked-banner">
-                    <span class="icon">🔒</span>
-                    <div class="title">此链接已失效</div>
-                    <div class="desc">该订单已结束或已被管理员释放</div>
-                </div>
-                <button class="btn btn-secondary" onclick="location.reload()">🔄 刷新页面</button>
-            </div>
-
-            <div id="statusBox"></div>
-
-            <div id="initBox">
-                <!-- 教程入口：已隐藏（代码保留） -->
-                <div class="tutorial-banner hidden" onclick="showTutorial()" title="点击查看登录教程">
-                    <span class="tb-icon">📖</span>
-                    <span>首次使用请查看登录教程</span>
-                    <span class="tb-arrow">›</span>
-                </div>
-
-                <button class="btn btn-primary" onclick="getPhone()" id="getPhoneBtn" style="font-size: 16px; padding: 15px 10px;">
-                    我要取号
-                </button>
-                <p class="text-tertiary" style="margin-top: 16px;">点击后获取手机号，有效期 180 秒</p>
-            </div>
-
-            <div id="phoneBox" class="hidden">
-                <!-- 教程入口：已隐藏（代码保留） -->
-                <div class="tutorial-banner hidden" onclick="showTutorial()" title="点击查看登录教程">
-                    <span class="tb-icon">📖</span>
-                    <span>首次使用必看登录教程</span>
-                    <span class="tb-arrow">›</span>
-                </div>
-
-                <div class="info-card">
-                    <div class="label">手机号码</div>
-                    <div class="phone-number" id="phoneDisplay">---</div>
-                </div>
-                <button class="btn-copy" onclick="copyPhone()">复制手机号</button>
-
-                <div style="margin-top: 18px; padding: 16px 12px; background: rgba(255, 59, 48, 0.08); border: 1.5px solid rgba(255, 59, 48, 0.25); border-radius: var(--radius-sm); text-align: center;">
-                    <span style="color: var(--danger); font-weight: 700; font-size: 16px; line-height: 1.6; display: inline-block;">
-                        耐心等待接收验证码<br>
-                        不要二次获取验证码，超时可以释放号码换号<br>
-                        二次获取验证导致验证失败不售后
-                    </span>
-                </div>
-
-                <div style="margin-top: 12px; padding: 16px 12px; background: rgba(255, 255, 255, 0.5); border-radius: var(--radius-sm); border: 1px solid var(--separator); text-align: center;">
-                    <span style="color: var(--text-primary); font-weight: 600; font-size: 15px; letter-spacing: 0.3px;">
-                        复制手机号获取验证码登录
-                    </span>
-                </div>
-
-                <div id="countdownDisplay" class="hidden">180s</div>
-
-                <div class="polling-indicator" id="pollingIndicator">
-                    <span class="polling-dot"></span>
-                    <span>正在轮询验证码...</span>
-                    <span class="poll-count" id="pollCount"></span>
-                </div>
-                <p class="text-quaternary" style="margin-top: 8px;">自动检测中，收到验证码将自动显示</p>
-
-                <button class="btn btn-secondary" onclick="releasePhone()" id="releaseBtn" disabled style="margin-top: 20px;">
-                    释放手机号，重新获取（180秒后可操作）
-                </button>
-            </div>
-
-            <div id="timeoutBox" class="hidden">
-                <div class="status-text status-warning">⏰ 手机号已过期（180秒未收到验证码）</div>
-                <p class="text-tertiary" style="margin-top: 8px;">号码已自动释放，请重新获取新号码</p>
-                <button class="btn btn-primary" onclick="getPhone()" id="getPhoneBtnTimeout" style="margin-top: 16px;">重新获取手机号</button>
-            </div>
-
-            <!-- ===== 已完成状态：紧凑手机号+验证码（口令区已隐藏） ===== -->
-            <div id="doneBox" class="hidden">
-                <!-- 教程入口：已隐藏（代码保留） -->
-                <div class="tutorial-banner hidden" onclick="showTutorial()" title="点击查看登录教程">
-                    <span class="tb-icon">📖</span>
-                    <span>首次使用必看登录教程</span>
-                    <span class="tb-arrow">›</span>
-                </div>
-
-                <!-- 紧凑：手机号 + 验证码 -->
-                <div class="compact-card">
-                    <div class="compact-row">
-                        <div class="compact-col">
-                            <div class="label">手机号</div>
-                            <div class="compact-phone" id="phoneDisplayDone">---</div>
-                        </div>
-                        <div class="compact-col">
-                            <div class="label">验证码</div>
-                            <div class="compact-code" id="codeDisplay">---</div>
-                        </div>
-                    </div>
-                    <div class="compact-copy-row">
-                        <button class="btn-copy" onclick="copyPhone()">📋 复制手机号</button>
-                        <button class="btn-copy" onclick="copyCode()">📋 复制验证码</button>
-                    </div>
-                </div>
-
-                <!-- 口令兑换区：已隐藏（代码保留，不删除） -->
-                <div class="codes-card hidden">
-                    <div class="codes-header"> 登录后兑换以下口令（按顺序全部兑换）</div>
-                    <div class="code-item">
-                        <span class="code-item-label">口令1</span>
-                        <span class="code-item-value">xunyou456</span>
-                        <button class="code-copy-btn" onclick="copyText('xunyou456', this)">复制</button>
-                    </div>
-                    <div class="code-item">
-                        <span class="code-item-label">口令2</span>
-                        <span class="code-item-value">TE727DUH</span>
-                        <button class="code-copy-btn" onclick="copyText('TE727DUH', this)">复制</button>
-                    </div>
-                    <div class="codes-note"> 口令按顺序全部兑换并且全部激活，不按顺序和囤货不售后</div>
-                </div>
-
-                <p class="text-tertiary" style="margin-top: 16px; color: var(--danger);">🔒 此订单已完成，链接永久失效。</p>
-            </div>
-
-            <div id="errorBox" class="hidden">
-                <div class="status-text status-error" id="errorMessage"></div>
-                <button class="btn btn-secondary" onclick="location.reload()" style="margin-top: 16px;">🔄 重试</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- ===== 教程弹窗（整体隐藏，代码保留） ===== -->
-    <div class="tutorial-overlay hidden" id="tutorialOverlay">
-        <div class="tutorial-modal">
-            <button class="tutorial-close" onclick="closeTutorial()">✕</button>
-
-            <div class="tutorial-title">📖 登录教程</div>
-            <div class="tutorial-subtitle">首次使用请按以下步骤操作</div>
-
-            <!-- 步骤 1 -->
-            <div class="tutorial-step">
-                <div class="tutorial-step-header">
-                    <div class="tutorial-step-num">1</div>
-                    <div class="tutorial-step-title">打开加速器，进入登录页面</div>
-                </div>
-                <img class="tutorial-step-img" src="https://pic.imgdd.cc/i/034aYX6JACIRtd7MvZXSER.png" alt="步骤1：打开加速器登录页面" loading="lazy">
-                <div class="tutorial-step-desc">
-                    迅游客户端必须带有口令入口，<strong>没口令入口去官网重下</strong>，没口令还去接验证码登录不退换
-                </div>
-            </div>
-
-            <!-- 步骤 2 -->
-            <div class="tutorial-step">
-                <div class="tutorial-step-header">
-                    <div class="tutorial-step-num">2</div>
-                    <div class="tutorial-step-title">输入手机号，获取验证码</div>
-                </div>
-                <img class="tutorial-step-img" src="https://pic.imgdd.cc/i/034aYX5ZFV8LOyzHj4xc28.png" alt="步骤2：输入手机号获取验证码" loading="lazy">
-                <div class="tutorial-step-desc">
-                    在登录页面输入上方获取到的<strong>手机号码</strong>，点击<strong>获取验证码</strong>按钮，然后在网页耐心等待验证码，不要二次获取，二次获取导致验证失败不售后。
-                </div>
-            </div>
-
-            <!-- 步骤 3 -->
-            <div class="tutorial-step">
-                <div class="tutorial-step-header">
-                    <div class="tutorial-step-num">3</div>
-                    <div class="tutorial-step-title">按顺序输入口令兑换码</div>
-                </div>
-                <img class="tutorial-step-img" src="https://pic.imgdd.cc/i/034aYXBIl0V6cpti0HZewG.png" alt="步骤3：输入验证码完成登录" loading="lazy">
-                <div class="tutorial-step-desc">
-                    登录后<strong>按顺序输入口令兑换码</strong>全部都要兑换，<strong>囤货不售后</strong>，兑换完成后点击窗口右上角的查看兑换记录
-                </div>
-            </div>
-
-            <!-- 步骤 4 -->
-            <div class="tutorial-step">
-                <div class="tutorial-step-header">
-                    <div class="tutorial-step-num">4</div>
-                    <div class="tutorial-step-title">兑换完成，去已兑换记录激活</div>
-                </div>
-                <img class="tutorial-step-img" src="https://pic.imgdd.cc/i/034aYWzgTWNZbr763i3fBJ.png" alt="步骤4：登录成功" loading="lazy">
-                <div class="tutorial-step-desc">
-                    全部一次激活，不要只激活一个，囤货过期不售后，<strong>有任何问题，拍视频留言，不要扯皮，后台都可以看记录
-                </div>
-            </div>
-
-            <div class="tutorial-tip">
-                💡 温馨提示：每个手机号仅可使用一次，退出或者换设备都需要重拍。
-            </div>
-
-            <button class="btn btn-primary tutorial-footer-btn" onclick="closeTutorial()">
-                我知道了
-            </button>
-        </div>
-    </div>
-
-    <script>
-        (function() {
-            'use strict';
-
-            const API_BASE = '/api/order';
-            const TIMEOUT_SEC = 180;
-            const POLL_INTERVAL = 4000;
-            const MAX_RETRIES = 46;
-
-            let currentOid = null;
-            let currentSid = '24085';
-            let currentPhone = null;
-            let countdownTimer = null;
-            let pollingTimer = null;
-            let isOrderDone = false;
-            let isGettingPhone = false;
-            let isOrderLocked = false;
-            let isOrderExpired = false;
-            let pureCode = '';
-            let pollAttempts = 0;
-
-            const noOrderView = document.getElementById('noOrderView');
-            const orderView = document.getElementById('orderView');
-            const lockedBox = document.getElementById('lockedBox');
-            const orderIdDisplay = document.getElementById('orderIdDisplay');
-            const statusBox = document.getElementById('statusBox');
-            const initBox = document.getElementById('initBox');
-            const phoneBox = document.getElementById('phoneBox');
-            const timeoutBox = document.getElementById('timeoutBox');
-            const doneBox = document.getElementById('doneBox');
-            const errorBox = document.getElementById('errorBox');
-            const phoneDisplay = document.getElementById('phoneDisplay');
-            const phoneDisplayDone = document.getElementById('phoneDisplayDone');
-            const codeDisplay = document.getElementById('codeDisplay');
-            const countdownDisplay = document.getElementById('countdownDisplay');
-            const errorMessage = document.getElementById('errorMessage');
-            const getPhoneBtn = document.getElementById('getPhoneBtn');
-            const getPhoneBtnTimeout = document.getElementById('getPhoneBtnTimeout');
-            const releaseBtn = document.getElementById('releaseBtn');
-            const pollingIndicator = document.getElementById('pollingIndicator');
-            const pollCount = document.getElementById('pollCount');
-
-            // ===== 教程弹窗（保留，不再有入口触发） =====
-            const tutorialOverlay = document.getElementById('tutorialOverlay');
-
-            window.showTutorial = function() {
-                tutorialOverlay.classList.remove('hidden');
-                document.body.style.overflow = 'hidden';
-            };
-
-            window.closeTutorial = function() {
-                tutorialOverlay.classList.add('hidden');
-                document.body.style.overflow = '';
-            };
-
-            tutorialOverlay.addEventListener('click', function(e) {
-                if (e.target === tutorialOverlay) {
-                    closeTutorial();
+          if (cancelData.code == 0 || cancelData.msg?.includes('成功')) {
+            const pool = await getPool();
+            const pEntry = pool.find(p => p.phone === phone);
+            if (pEntry && pEntry.status === 'in_use') {
+              if (pEntry.oid) {
+                const order = await kv.get(pEntry.oid, { type: 'json' });
+                if (order && order.status === 'active') {
+                  order.status = 'released'; order.phone = null; order.expire = null;
+                  await kv.put(pEntry.oid, JSON.stringify(order), {
+                    metadata: { createdAt: order.createdAt || 0, status: 'released' }
+                  });
+                  await removeFromActiveIndex(pEntry.oid);
                 }
+              }
+              pEntry.status = 'available'; pEntry.oid = null; pEntry.expire = null;
+              await savePool(pool);
+            }
+            return jsonResponse({ success: true, msg: cancelData.msg || '释放成功' });
+          }
+          return jsonResponse({ success: false, error: cancelData.msg || '平台释放失败' }, 400);
+        } catch (e) {
+          return jsonResponse({ error: '请求接码平台失败: ' + e.message }, 500);
+        }
+      }
+
+      case 'listActiveOrders': {
+        const activeIndex = await kv.get(ACTIVE_INDEX_KEY, { type: 'json' }) || {};
+        const now = Date.now();
+        let changed = false;
+        const orders = [];
+        for (const oid in activeIndex) {
+          const item = activeIndex[oid];
+          if (item.expire && now >= item.expire) { delete activeIndex[oid]; changed = true; }
+          else orders.push(item);
+        }
+        if (changed) await kv.put(ACTIVE_INDEX_KEY, JSON.stringify(activeIndex));
+        return jsonResponse({ orders });
+      }
+
+      case 'listAllOrders': {
+        const cursorStr = url.searchParams.get('cursor') || null;
+        const limit = Math.min(parseInt(url.searchParams.get('limit')) || 100, 200);
+
+        const index = await getOrderIndex();
+        const start = cursorStr ? Math.max(parseInt(cursorStr) || 0, 0) : 0;
+        const end = Math.min(start + limit, index.length);
+        const pageItems = index.slice(start, end);
+
+        const orders = [];
+        const BATCH_SIZE = 20;
+        for (let i = 0; i < pageItems.length; i += BATCH_SIZE) {
+          const batch = pageItems.slice(i, i + BATCH_SIZE);
+          const results = await Promise.all(
+            batch.map(item =>
+              kv.get(item.oid, { type: 'json' }).catch(e => {
+                console.error(`读取订单 ${item.oid} 失败:`, e);
+                return null;
+              })
+            )
+          );
+          batch.forEach((item, idx) => {
+            const order = results[idx];
+            if (order && order.status === 'done') {
+              orders.push({
+                oid: item.oid,
+                phone: order.phone || '---',
+                assignedPhone: order.assignedPhone || '',
+                status: order.status,
+                code: order.code || '',
+                expire: order.expire || null,
+                doneTime: order.doneTime || null,
+                createdAt: order.createdAt || item.createdAt || null,
+                phoneAssignedAt: order.phoneAssignedAt || null
+              });
+            }
+          });
+        }
+
+        return jsonResponse({
+          orders,
+          cursor: end < index.length ? String(end) : null,
+          list_complete: end >= index.length,
+          total: index.length
+        });
+      }
+
+      case 'rebuildOrderIndex': {
+        await kv.delete(ORDER_INDEX_KEY);
+        const items = await buildOrderIndexFromList();
+        return jsonResponse({ success: true, total: items.length });
+      }
+
+      case 'releaseAllOrders': {
+        const activeIndex = await kv.get(ACTIVE_INDEX_KEY, { type: 'json' }) || {};
+        const activeOids = Object.keys(activeIndex);
+        const results = [];
+        for (const oid of activeOids) {
+          const result = await releaseOrderByOid(oid);
+          results.push({ oid, success: result.success, error: result.error });
+        }
+        const successCount = results.filter(r => r.success).length;
+        return jsonResponse({ success: true, released: successCount, total: results.length, details: results });
+      }
+
+      case 'createOrder': {
+        if (!oid) return jsonResponse({ error: '缺少订单ID' }, 400);
+        const existing = await kv.get(oid, { type: 'json' });
+        if (existing) return jsonResponse({ error: '订单已存在' }, 400);
+
+        const specifiedPhone = url.searchParams.get('phone') || '';
+        const ascription = url.searchParams.get('ascription') || '';
+        const paragraph  = url.searchParams.get('paragraph')  || '';
+        const exclude    = url.searchParams.get('exclude')    || '';
+        const isp        = url.searchParams.get('isp')        || '';
+        const province   = url.searchParams.get('Province')   || '';
+        const uid        = url.searchParams.get('uid')        || '';
+
+        const createdAt = Date.now();
+        const newOrder = {
+          status: 'new',
+          sid,
+          assignedPhone: specifiedPhone,
+          phone: null, expire: null, code: null,
+          fromPool: false,
+          createdAt,
+          filters: { ascription, paragraph, exclude, isp, province, uid }
+        };
+
+        await kv.put(oid, JSON.stringify(newOrder), {
+          metadata: { createdAt, status: 'new' }
+        });
+
+        return jsonResponse({ success: true });
+      }
+
+      case 'generateCard': {
+        const type = url.searchParams.get('type') || 'trial';
+        const count = parseInt(url.searchParams.get('count')) || 1;
+        if (count < 1 || count > 100) return jsonResponse({ error: '数量需在1-100之间' }, 400);
+        const duration = type === 'month' ? 30 : 1;
+        const cards = await getCards();
+        const generated = [];
+        for (let i = 0; i < count; i++) {
+          const key = generateCardKey();
+          cards.push({ key, type, duration, activated: false, activated_at: null, expire_at: null, created_at: Date.now() });
+          generated.push(key);
+        }
+        await saveCards(cards);
+        return jsonResponse({ success: true, keys: generated });
+      }
+
+      case 'activateCard': {
+        const key = url.searchParams.get('key');
+        if (!key) return jsonResponse({ error: '缺少卡密' }, 400);
+        const cards = await getCards();
+        const card = cards.find(c => c.key === key);
+        if (!card) return jsonResponse({ error: '卡密不存在' }, 404);
+        if (card.activated) {
+          if (Date.now() > card.expire_at) return jsonResponse({ error: '卡密已过期' }, 400);
+          return jsonResponse({ success: true, expire_at: card.expire_at });
+        }
+        const now = Date.now();
+        card.activated = true; card.activated_at = now;
+        card.expire_at = now + card.duration * 86400 * 1000;
+        await saveCards(cards);
+        return jsonResponse({ success: true, expire_at: card.expire_at });
+      }
+
+      case 'verifyCard': {
+        const key = url.searchParams.get('key');
+        if (!key) return jsonResponse({ error: '缺少卡密' }, 400);
+        const cards = await getCards();
+        const card = cards.find(c => c.key === key);
+        if (!card) return jsonResponse({ error: '卡密不存在' }, 404);
+        if (!card.activated) return jsonResponse({ valid: false, msg: '未激活' });
+        if (Date.now() > card.expire_at) return jsonResponse({ valid: false, msg: '已过期' });
+        return jsonResponse({ valid: true, expire_at: card.expire_at });
+      }
+
+      case 'cardList': {
+        const cards = await getCards();
+        return jsonResponse({ cards });
+      }
+
+      case 'deleteCard': {
+        const key = url.searchParams.get('key');
+        if (!key) return jsonResponse({ error: '缺少卡密' }, 400);
+        let cards = await getCards();
+        cards = cards.filter(c => c.key !== key);
+        await saveCards(cards);
+        return jsonResponse({ success: true });
+      }
+
+      case 'getBalance': {
+        const tokenStr = await getValidToken();
+        const balanceResp = await fetchWithTimeout(`https://${HAOZHU.server}/sms/?api=getSummary&token=${tokenStr}`);
+        const balanceData = await balanceResp.json();
+        if (balanceData.code == 0) {
+          const bal = balanceData.balance || balanceData.summary || balanceData.money ||
+                      balanceData.data?.balance || balanceData.data?.money || balanceData.amount;
+          if (bal === undefined || bal === null) {
+            return jsonResponse({ error: '未找到余额字段，原始响应: ' + JSON.stringify(balanceData) });
+          }
+          return jsonResponse({ balance: bal });
+        }
+        return jsonResponse({ error: balanceData.msg || '查询失败' });
+      }
+
+      case 'blockPhone': {
+        const phone = url.searchParams.get('phone');
+        if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+        const tokenStr = await getValidToken();
+        const blockResp = await fetchWithTimeout(`https://${HAOZHU.server}/sms/?api=addBlacklist&token=${tokenStr}&sid=${HAOZHU.sid}&phone=${phone}`);
+        const blockData = await blockResp.json();
+        if (blockData.code == 0) {
+          let pool = await getPool();
+          pool = pool.filter(p => p.phone !== phone);
+          await savePool(pool);
+          return jsonResponse({ success: true });
+        }
+        return jsonResponse({ error: blockData.msg || '拉黑失败' });
+      }
+
+      case 'lockOrder': {
+        if (!oid) return jsonResponse({ error: '缺少订单ID' }, 400);
+        const result = await releaseOrderByOid(oid);
+        return result.success ? jsonResponse({ success: true }) : jsonResponse({ error: result.error }, 400);
+      }
+
+      case 'poolList': {
+        const pool = await getPool();
+        return jsonResponse({ pool });
+      }
+
+      case 'addPhone': {
+        const phone = url.searchParams.get('phone');
+        if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+        const pool = await getPool();
+        if (pool.some(p => p.phone === phone)) return jsonResponse({ error: '号码已存在' }, 400);
+        pool.push({ phone, status: 'available', oid: null, expire: null });
+        await savePool(pool);
+        return jsonResponse({ success: true });
+      }
+
+      case 'removePhone': {
+        const phone = url.searchParams.get('phone');
+        if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+        let pool = await getPool();
+        pool = pool.filter(p => p.phone !== phone);
+        await savePool(pool);
+        return jsonResponse({ success: true });
+      }
+
+      case 'resetPool': {
+        const pool = await getPool();
+        for (const p of pool) {
+          if (p.status === 'in_use' && p.oid) {
+            const order = await kv.get(p.oid, { type: 'json' });
+            if (order && order.status === 'active') {
+              order.status = 'released'; order.phone = null; order.expire = null;
+              await kv.put(p.oid, JSON.stringify(order), {
+                metadata: { createdAt: order.createdAt || 0, status: 'released' }
+              });
+              await removeFromActiveIndex(p.oid);
+            }
+            p.status = 'available'; p.oid = null; p.expire = null;
+          }
+        }
+        await savePool(pool);
+        return jsonResponse({ success: true });
+      }
+
+      case 'releasePoolPhone': {
+        const phone = url.searchParams.get('phone');
+        if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+        const pool = await getPool();
+        const entry = pool.find(p => p.phone === phone);
+        if (!entry) return jsonResponse({ error: '号码不在池中' }, 404);
+        if (entry.status !== 'in_use') return jsonResponse({ error: '该号码未被占用' }, 400);
+        if (entry.oid) {
+          const order = await kv.get(entry.oid, { type: 'json' });
+          if (order && order.status === 'active') {
+            order.status = 'released'; order.phone = null; order.expire = null;
+            await kv.put(entry.oid, JSON.stringify(order), {
+              metadata: { createdAt: order.createdAt || 0, status: 'released' }
             });
+            await removeFromActiveIndex(entry.oid);
+          }
+        }
+        entry.status = 'available'; entry.oid = null; entry.expire = null;
+        await savePool(pool);
+        return jsonResponse({ success: true });
+      }
 
-            document.addEventListener('keydown', function(e) {
-                if (e.key === 'Escape' && !tutorialOverlay.classList.contains('hidden')) {
-                    closeTutorial();
-                }
+      case 'logList': {
+        const logs = await getLogs();
+        return jsonResponse({ logs: logs.reverse() });
+      }
+
+      case 'status': {
+        const order = await kv.get(oid, { type: 'json' });
+        if (!order) return jsonResponse({ status: 'invalid', phone: null, expire: null, code: null });
+        if (order.expire && order.status === 'active' && Date.now() >= order.expire) {
+          await releaseOrderPhone(order, oid);
+          order.status = 'expired'; order.phone = null; order.expire = null;
+          await kv.put(oid, JSON.stringify(order), {
+            metadata: { createdAt: order.createdAt || 0, status: 'expired' }
+          });
+          return jsonResponse({ status: 'expired', phone: null, expire: null, code: null });
+        }
+        return jsonResponse(order);
+      }
+
+      case 'getPhone': {
+        let order = await kv.get(oid, { type: 'json' });
+        if (!order) return jsonResponse({ error: '订单不存在或已失效' }, 404);
+        if (order.status === 'done') return jsonResponse({ error: '订单已完成' }, 403);
+        if (order.status === 'released') return jsonResponse({ error: '订单已被管理员释放' }, 403);
+
+        if (order.status === 'expired') {
+          order.status = 'new'; order.phone = null; order.expire = null; order.code = null; order.fromPool = false;
+          await kv.put(oid, JSON.stringify(order), {
+            metadata: { createdAt: order.createdAt || 0, status: 'new' }
+          });
+        }
+
+        if (order.status === 'active' && order.expire && Date.now() < order.expire) {
+          return jsonResponse({ phone: order.phone, expire: order.expire });
+        }
+
+        if (order.status === 'active' && order.expire && Date.now() >= order.expire) {
+          await releaseOrderPhone(order, oid);
+          order.status = 'new'; order.phone = null; order.expire = null; order.code = null; order.fromPool = false;
+          await kv.put(oid, JSON.stringify(order), {
+            metadata: { createdAt: order.createdAt || 0, status: 'new' }
+          });
+        }
+
+        if (order.phone && order.fromPool) {
+          const pool = await getPool();
+          const entry = pool.find(p => p.phone === order.phone);
+          if (entry && entry.status === 'in_use') {
+            entry.status = 'available'; entry.oid = null; entry.expire = null;
+            await savePool(pool);
+          }
+        }
+
+        const tokenStr = await getValidToken();
+        const orderSid = order.sid || HAOZHU.sid;
+
+        if (order.assignedPhone) {
+          const reqUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}&phone=${encodeURIComponent(order.assignedPhone)}`;
+          const phoneResp = await fetchWithTimeout(reqUrl);
+          const phoneData = await phoneResp.json();
+          if (phoneData.code == 0) {
+            const realPhone = phoneData.phone || phoneData.Phone || phoneData.mobile || order.assignedPhone;
+            order.phone = realPhone;
+            order.expire = Date.now() + PHONE_TTL_MS;
+            order.status = 'active';
+            order.code = null;
+            order.fromPool = false;
+            order.phoneAssignedAt = Date.now();
+            await kv.put(oid, JSON.stringify(order), {
+              metadata: { createdAt: order.createdAt || 0, status: 'active' }
             });
+            await updateActiveIndex(oid, realPhone, order.expire);
+            return jsonResponse({ phone: realPhone, expire: order.expire });
+          }
+          return jsonResponse({ error: '获取指定手机号失败：' + (phoneData.msg || '平台无该号或已被占用') }, 400);
+        }
 
-            // ===== 复制工具函数 =====
-            function fallbackCopy(text, btn) {
-                const ta = document.createElement('textarea');
-                ta.value = text;
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.select();
-                try {
-                    document.execCommand('copy');
-                    if (btn) {
-                        btn.classList.add('copied');
-                        btn.textContent = '已复制 ✓';
-                        setTimeout(() => { btn.classList.remove('copied'); btn.textContent = '复制'; }, 1500);
-                    } else {
-                        alert('已复制');
-                    }
-                } catch (err) {
-                    alert('复制失败，请手动复制');
-                }
-                document.body.removeChild(ta);
+        const pool = await getPool();
+        const available = pool.filter(p => p.status === 'available');
+        if (available.length > 0) {
+          const chosen = available[Math.floor(Math.random() * available.length)];
+          const phone = chosen.phone;
+          const expire = Date.now() + PHONE_TTL_MS;
+
+          try {
+            const activateUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}&phone=${phone}`;
+            await fetchWithTimeout(activateUrl);
+          } catch (e) {}
+
+          chosen.status = 'in_use'; chosen.oid = oid; chosen.expire = expire;
+          await savePool(pool);
+
+          const newOrder = {
+            ...order, phone, expire, status: 'active', code: null, fromPool: true,
+            phoneAssignedAt: Date.now()
+          };
+          await kv.put(oid, JSON.stringify(newOrder), {
+            metadata: { createdAt: newOrder.createdAt || 0, status: 'active' }
+          });
+          await updateActiveIndex(oid, phone, expire);
+          return jsonResponse({ phone, expire });
+        }
+
+        const f = order.filters || {};
+        let apiUrl = `https://${HAOZHU.server}/sms/?api=getPhone&token=${tokenStr}&sid=${orderSid}`;
+        if (f.ascription) apiUrl += `&ascription=${encodeURIComponent(f.ascription)}`;
+        if (f.paragraph)  apiUrl += `&paragraph=${encodeURIComponent(f.paragraph)}`;
+        if (f.exclude)    apiUrl += `&exclude=${encodeURIComponent(f.exclude)}`;
+        if (f.isp)        apiUrl += `&isp=${encodeURIComponent(f.isp)}`;
+        if (f.province)   apiUrl += `&Province=${encodeURIComponent(f.province)}`;
+        if (f.uid)        apiUrl += `&uid=${encodeURIComponent(f.uid)}`;
+
+        const phoneResp = await fetchWithTimeout(apiUrl);
+        const phoneData = await phoneResp.json();
+        if (phoneData.code == 0) {
+          const phone = phoneData.phone || phoneData.Phone || phoneData.mobile;
+          const newOrder = {
+            ...order, phone, expire: Date.now() + PHONE_TTL_MS,
+            status: 'active', code: null, fromPool: false,
+            phoneAssignedAt: Date.now()
+          };
+          await kv.put(oid, JSON.stringify(newOrder), {
+            metadata: { createdAt: newOrder.createdAt || 0, status: 'active' }
+          });
+          await updateActiveIndex(oid, phone, newOrder.expire);
+          return jsonResponse({ phone, expire: newOrder.expire });
+        }
+        return jsonResponse({ error: phoneData.msg || '取号失败' }, 500);
+      }
+
+      case 'release': {
+        const order = await kv.get(oid, { type: 'json' });
+        if (!order) return jsonResponse({ error: '订单不存在' }, 404);
+        if (order.status === 'done') return jsonResponse({ error: '订单已完成' }, 403);
+
+        await releaseOrderPhone(order, oid);
+
+        order.status = 'new'; order.phone = null; order.expire = null; order.code = null; order.fromPool = false;
+        await kv.put(oid, JSON.stringify(order), {
+          metadata: { createdAt: order.createdAt || 0, status: 'new' }
+        });
+        return jsonResponse({ success: true });
+      }
+
+      // ============================================================
+      // ★【改动点 3】getSMS 收到验证码：只写 order 一次
+      // 原来还会触发 removeFromActiveIndex / addLog / pushToOrderIndex
+      // 共 4 次写入，现在缩减为 1 次。
+      // 影响：
+      //   - activeIndex 里会残留这条（过期后由 listActiveOrders 自动清理）
+      //   - logList 不再记录 sms_received
+      //   - listAllOrders 不再自动出现新订单，需要管理员手动点 rebuildOrderIndex
+      // ============================================================
+      case 'getSMS': {
+        const order = await kv.get(oid, { type: 'json' });
+        if (!order) return jsonResponse({ error: '订单不存在' }, 404);
+
+        if (order.status === 'active' && order.expire && Date.now() >= order.expire) {
+          await releaseOrderPhone(order, oid);
+          order.status = 'expired'; order.phone = null; order.expire = null;
+          await kv.put(oid, JSON.stringify(order), {
+            metadata: { createdAt: order.createdAt || 0, status: 'expired' }
+          });
+          return jsonResponse({ status: 'expired', code: null });
+        }
+
+        if (!order.phone) return jsonResponse({ error: '订单不存在' }, 404);
+        if (order.status !== 'active') return jsonResponse({ status: order.status, code: order.code || null });
+
+        const tokenStr = await getValidToken();
+        const orderSid = order.sid || HAOZHU.sid;
+        const smsResp = await fetchWithTimeout(`https://${HAOZHU.server}/sms/?api=getMessage&token=${tokenStr}&sid=${orderSid}&phone=${order.phone}`);
+        const smsData = await smsResp.json();
+
+        if (smsData.code == 0) {
+          const raw = smsData.sms || smsData.Sms || smsData.message || smsData.code_text || '';
+          if (raw) {
+            const match = raw.match(/(?<!\d)(\d{4,6})(?!\d)/);
+            if (match) {
+              order.code = match[1];
+              order.status = 'done';
+              order.doneTime = Date.now();
+
+              // ★ 唯一必要写入：order 自身
+              await kv.put(oid, JSON.stringify(order), {
+                metadata: { createdAt: order.createdAt || 0, status: 'done' }
+              });
+
+              // ❌ 以下调用已禁用，用于节省 KV 写入配额
+              //    （每天 1000 次免费额度，每单多写 3 次就少卖 3 单）
+              //
+              // await removeFromActiveIndex(oid);
+              // await addLog(order.phone, oid, 'sms_received');
+              // try {
+              //   await pushToOrderIndex(oid, order.createdAt || Date.now());
+              // } catch (e) {
+              //   console.error('加入订单索引失败:', e);
+              // }
+
+              return jsonResponse({ code: match[1], status: 'done' });
             }
+          }
+        }
+        return jsonResponse({ code: null, status: 'active' });
+      }
 
-            window.copyText = function(text, btn) {
-                if (!text) return;
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText(text).then(() => {
-                        if (btn) {
-                            btn.classList.add('copied');
-                            btn.textContent = '已复制 ✓';
-                            setTimeout(() => { btn.classList.remove('copied'); btn.textContent = '复制'; }, 1500);
-                        } else {
-                            alert('已复制');
-                        }
-                    }).catch(() => fallbackCopy(text, btn));
-                } else {
-                    fallbackCopy(text, btn);
-                }
-            };
+      case 'setPhone': {
+        const phone = url.searchParams.get('phone');
+        if (!phone) return jsonResponse({ error: '缺少 phone 参数' }, 400);
+        const order = { phone, expire: 0, status: 'pending', code: null, fromPool: false, createdAt: Date.now() };
+        await kv.put(oid, JSON.stringify(order), {
+          metadata: { createdAt: order.createdAt, status: 'pending' }
+        });
+        return jsonResponse({ success: true });
+      }
 
-            // ===== 以下原有逻辑保持不变 =====
-            function showUI(state) {
-                initBox.classList.add('hidden');
-                phoneBox.classList.add('hidden');
-                timeoutBox.classList.add('hidden');
-                doneBox.classList.add('hidden');
-                errorBox.classList.add('hidden');
-                lockedBox.classList.add('hidden');
-                statusBox.classList.add('hidden');
-                if (state === 'locked') { lockedBox.classList.remove('hidden'); }
-                else if (state === 'init') { initBox.classList.remove('hidden'); }
-                else if (state === 'active') { phoneBox.classList.remove('hidden'); statusBox.classList.remove('hidden'); }
-                else if (state === 'timeout') { timeoutBox.classList.remove('hidden'); statusBox.classList.remove('hidden'); }
-                else if (state === 'done') { doneBox.classList.remove('hidden'); statusBox.classList.remove('hidden'); }
-                else if (state === 'error') { errorBox.classList.remove('hidden'); statusBox.classList.remove('hidden'); }
-            }
+      default:
+        return jsonResponse({ error: '未知操作' }, 400);
+    }
 
-            function setStatus(msg, type) {
-                const classes = { info: 'status-info', success: 'status-success', warning: 'status-warning', error: 'status-error' };
-                statusBox.className = 'status-text ' + (classes[type] || '');
-                statusBox.innerHTML = msg;
-                statusBox.classList.remove('hidden');
-            }
+  } catch (e) {
+    return new Response(JSON.stringify({ error: 'Worker 内部异常: ' + e.message }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store'
+      }
+    });
+  }
+}
 
-            function disableAllButtons() {
-                getPhoneBtn.disabled = true;
-                getPhoneBtnTimeout.disabled = true;
-                releaseBtn.disabled = true;
-            }
-
-            function enableGetButtons() {
-                getPhoneBtn.disabled = false;
-                getPhoneBtnTimeout.disabled = false;
-            }
-
-            function extractNumbers(str) {
-                return (str.match(/\d+/g) || []).join('');
-            }
-
-            window.copyPhone = function() {
-                const phone = currentPhone || phoneDisplay.textContent.trim();
-                if (!phone || phone === '---') return;
-                copyText(phone);
-            };
-
-            window.copyCode = function() {
-                const code = pureCode || extractNumbers(codeDisplay.textContent);
-                if (!code) return;
-                copyText(code);
-            };
-
-            async function apiCall(action, params = {}) {
-                const url = new URL(API_BASE, location.origin);
-                url.searchParams.set('action', action);
-                url.searchParams.set('oid', currentOid);
-                url.searchParams.set('sid', currentSid);
-                Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-                const resp = await fetch(url);
-                const data = await resp.json();
-                if (!resp.ok) {
-                    const err = new Error(data.error || '请求失败');
-                    err.status = resp.status;
-                    err.data = data;
-                    throw err;
-                }
-                return data;
-            }
-
-            function stopAllTimers() {
-                if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
-                if (pollingTimer) { clearInterval(pollingTimer); pollingTimer = null; }
-                if (pollingIndicator) { pollingIndicator.style.display = 'none'; }
-            }
-
-            function stopPolling() {
-                if (pollingTimer) { clearInterval(pollingTimer); pollingTimer = null; }
-                if (pollingIndicator) { pollingIndicator.style.display = 'none'; }
-            }
-
-            function updatePollIndicator() {
-                if (pollingIndicator) {
-                    pollingIndicator.style.display = 'flex';
-                    pollCount.textContent = `(${pollAttempts} 次)`;
-                }
-            }
-
-            function handleGotCode(phone, code) {
-                isOrderDone = true;
-                disableAllButtons();
-                stopAllTimers();
-                if (phone) {
-                    currentPhone = phone;
-                    phoneDisplayDone.textContent = phone;
-                }
-                pureCode = extractNumbers(code);
-                codeDisplay.textContent = code;
-                showUI('done');
-                setStatus('验证码已收到', 'success');
-            }
-
-            function handleExpired() {
-                isOrderExpired = true;
-                stopAllTimers();
-                enableGetButtons();
-                showUI('timeout');
-                setStatus('手机号已过期，可重新获取', 'warning');
-            }
-
-            function startPolling() {
-                stopPolling();
-                pollAttempts = 0;
-                updatePollIndicator();
-
-                pollingTimer = setInterval(async () => {
-                    if (isOrderDone || isOrderLocked || isOrderExpired) { stopAllTimers(); return; }
-
-                    pollAttempts++;
-                    updatePollIndicator();
-
-                    try {
-                        const statusData = await apiCall('status');
-
-                        if (statusData.status === 'expired') {
-                            handleExpired();
-                            return;
-                        }
-
-                        if (statusData.status === 'released' || statusData.status === 'invalid') {
-                            isOrderLocked = true;
-                            stopAllTimers();
-                            showUI('locked');
-                            return;
-                        }
-
-                        if (statusData.status === 'done' && statusData.code) {
-                            handleGotCode(statusData.phone, statusData.code);
-                            return;
-                        }
-
-                        if (statusData.status === 'active') {
-                            const sms = await apiCall('getSMS');
-
-                            if (sms.status === 'expired') {
-                                handleExpired();
-                                return;
-                            }
-                            if (sms.status === 'done' && sms.code) {
-                                handleGotCode(statusData.phone, sms.code);
-                                return;
-                            }
-                        }
-
-                        if (pollAttempts >= MAX_RETRIES) {
-                            stopAllTimers();
-                            enableGetButtons();
-                            showUI('timeout');
-                            setStatus('验证码等待超时，请尝试重新获取', 'warning');
-                        }
-
-                    } catch (error) {
-                        console.error('[轮询异常]', error);
-                        if (error.status === 403 || error.status === 404 || error.message.includes('释放') || error.message.includes('失效')) {
-                            isOrderLocked = true;
-                            stopAllTimers();
-                            showUI('locked');
-                            return;
-                        }
-                        setStatus('检测网络中，继续等待...', 'warning');
-                    }
-                }, POLL_INTERVAL);
-            }
-
-            window.getPhone = async function() {
-                if (isOrderDone || isGettingPhone || isOrderLocked) return;
-
-                isOrderExpired = false;
-                isGettingPhone = true;
-                disableAllButtons();
-                showUI('active');
-                phoneDisplay.textContent = '获取中...';
-                setStatus('正在获取手机号...', 'info');
-
-                try {
-                    const data = await apiCall('getPhone');
-
-                    if (data.status === 'done') {
-                        handleGotCode(data.phone, data.code);
-                        return;
-                    }
-
-                    currentPhone = data.phone;
-                    phoneDisplay.textContent = data.phone;
-                    startCountdown(data.expire);
-                    setStatus('手机号已获取，正在等待验证码...', 'info');
-                    startPolling();
-                } catch (e) {
-                    if (e.status === 403 || e.status === 404 || e.message.includes('释放') || e.message.includes('失效')) {
-                        isOrderLocked = true;
-                        stopAllTimers();
-                        showUI('locked');
-                        return;
-                    }
-                    enableGetButtons();
-                    showUI('error');
-                    errorMessage.textContent = e.message;
-                } finally {
-                    isGettingPhone = false;
-                }
-            };
-
-            function startCountdown(expireTs) {
-                if (countdownTimer) clearInterval(countdownTimer);
-                const update = () => {
-                    if (isOrderLocked || isOrderExpired) { clearInterval(countdownTimer); return; }
-                    const remain = Math.max(0, Math.ceil((expireTs - Date.now()) / 1000));
-                    countdownDisplay.textContent = remain + 's';
-                    if (remain > 0) {
-                        releaseBtn.disabled = true;
-                        releaseBtn.textContent = `释放手机号，重新获取（${remain}秒后可操作）`;
-                    } else {
-                        clearInterval(countdownTimer);
-                        countdownTimer = null;
-                        releaseBtn.disabled = false;
-                        releaseBtn.textContent = '释放手机号，重新获取';
-                        setStatus('号码即将释放，可稍候自动换新号', 'warning');
-                    }
-                };
-                update();
-                countdownTimer = setInterval(update, 1000);
-            }
-
-            window.releasePhone = async function() {
-                if (isOrderDone || !currentPhone || isOrderLocked) return;
-                if (!confirm('确定释放当前手机号吗？')) return;
-                try {
-                    await apiCall('release');
-                    currentPhone = null;
-                    isOrderExpired = false;
-                    stopAllTimers();
-                    enableGetButtons();
-                    showUI('init');
-                    setStatus('', 'info');
-                } catch (e) {
-                    alert('释放失败');
-                }
-            };
-
-            async function checkOrder() {
-                if (!currentOid) return;
-                try {
-                    const data = await apiCall('status');
-
-                    if (data.status === 'invalid' || data.status === 'released') {
-                        isOrderLocked = true;
-                        stopAllTimers();
-                        showUI('locked');
-                        return;
-                    }
-
-                    if (data.status === 'expired') {
-                        enableGetButtons();
-                        showUI('timeout');
-                        setStatus('手机号已过期，可重新获取', 'warning');
-                        return;
-                    }
-
-                    if (data.status === 'done' && data.code && extractNumbers(data.code).length >= 4) {
-                        isOrderDone = true;
-                        disableAllButtons();
-                        currentPhone = data.phone;
-                        phoneDisplayDone.textContent = data.phone;
-                        pureCode = extractNumbers(data.code);
-                        codeDisplay.textContent = data.code;
-                        showUI('done');
-                        setStatus('验证码已收到', 'success');
-                        return;
-                    }
-
-                    if (data.status === 'active' && data.phone && data.expire && Date.now() < data.expire) {
-                        isOrderDone = false;
-                        disableAllButtons();
-                        currentPhone = data.phone;
-                        phoneDisplay.textContent = data.phone;
-                        startCountdown(data.expire);
-                        showUI('active');
-                        setStatus('手机号已获取，正在等待验证码...', 'info');
-                        startPolling();
-                        return;
-                    }
-
-                    showUI('init');
-                    enableGetButtons();
-                } catch (e) {
-                    if (e.status === 403 || e.status === 404 || e.message.includes('释放') || e.message.includes('失效')) {
-                        isOrderLocked = true;
-                        stopAllTimers();
-                        showUI('locked');
-                        return;
-                    }
-                    showUI('error');
-                    errorMessage.textContent = e.message;
-                }
-            }
-
-            // 初始化
-            (function init() {
-                let oid = null;
-
-                const pathOid = location.pathname.replace(/^\/+|\/+$/g, '');
-                if (/^HZ[A-Z0-9]+$/i.test(pathOid)) {
-                    oid = pathOid;
-                }
-
-                const params = new URLSearchParams(location.search);
-                if (!oid) {
-                    oid = params.get('oid');
-                }
-
-                const sid = params.get('sid');
-
-                if (!oid) return;
-                if (sid) currentSid = sid;
-                currentOid = oid;
-                orderIdDisplay.textContent = '订单号: ' + oid;
-                noOrderView.classList.add('hidden');
-                orderView.classList.remove('hidden');
-                checkOrder();
-            })();
-
-        })();
-    </script>
-
-</body>
-</html>
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
+    }
+  });
+}
