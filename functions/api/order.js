@@ -1,7 +1,6 @@
 // ============ 全局常量 ============
-const PHONE_TTL_MS = 180 * 1000;             // 手机号有效期：180 秒
+const PHONE_TTL_MS = 180 * 1000;
 
-// ============ 带超时的 fetch ============
 async function fetchWithTimeout(url, options = {}, timeout = 4000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
@@ -34,15 +33,22 @@ export async function onRequest(context) {
   const oid = url.searchParams.get('oid');
 
   try {
-    const kv = env.ORDERS;
-    const db = env.order_db; // 你绑定的 D1 变量名
+    const db = env.order_db; // 我们的核心：全部走 D1
     if (!db) throw new Error('严重错误：后端 D1 数据库 (order_db) 未绑定');
-    if (!kv) throw new Error('严重错误：后端 KV 数据库 (ORDERS) 未绑定');
+
+    // ====== D1 通用配置读写函数（替代 KV） ======
+    async function getSetting(key) {
+      const res = await db.prepare(`SELECT value FROM settings WHERE key=?`).bind(key).first();
+      return res ? JSON.parse(res.value) : null;
+    }
+    async function setSetting(key, val) {
+      await db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`).bind(key, JSON.stringify(val)).run();
+    }
 
     const POOL_KEY = 'phone_pool';
     const CARD_KEY = 'card_keys';
 
-    const apiCfg = await kv.get('__api_config__', { type: 'json' }) || {};
+    const apiCfg = await getSetting('__api_config__') || {};
     const apiUser = apiCfg.user || '';
     const apiPass = apiCfg.pass || '';
     const sid = url.searchParams.get('sid') || apiCfg.sid || '24085';
@@ -59,13 +65,11 @@ export async function onRequest(context) {
 
     const HAOZHU = { server: 'api.haozhuma.com', user: apiUser, pass: apiPass, sid };
 
-    // ====== 低频操作依然用 KV ======
-    async function getPool() { const p = await kv.get(POOL_KEY, { type: 'json' }); return p || []; }
-    async function savePool(pool) { await kv.put(POOL_KEY, JSON.stringify(pool)); }
-    async function getCards() { const c = await kv.get(CARD_KEY, { type: 'json' }); return c || []; }
-    async function saveCards(cards) { await kv.put(CARD_KEY, JSON.stringify(cards)); }
+    async function getPool() { return (await getSetting(POOL_KEY)) || []; }
+    async function savePool(pool) { await setSetting(POOL_KEY, pool); }
+    async function getCards() { return (await getSetting(CARD_KEY)) || []; }
+    async function saveCards(cards) { await setSetting(CARD_KEY, cards); }
 
-    // ====== 高频操作改用 D1 ======
     async function addLog(phone, oid, action) {
       await db.prepare(`INSERT INTO logs (phone, oid, action, time) VALUES (?, ?, ?, ?)`)
         .bind(phone, oid, action, Date.now()).run();
@@ -83,7 +87,7 @@ export async function onRequest(context) {
 
     async function getValidToken() {
       if (!HAOZHU.user || !HAOZHU.pass) throw new Error('未配置接码平台账号密码');
-      const tokenData = await kv.get('__token_data__', { type: 'json' });
+      const tokenData = await getSetting('__token_data__');
       let tokenStr = tokenData ? tokenData.token : null;
       let tokenExpiry = tokenData ? tokenData.expire : 0;
       const needLogin = !tokenStr || Date.now() >= tokenExpiry - 300000;
@@ -94,7 +98,7 @@ export async function onRequest(context) {
         if (loginData.code == 0) {
           tokenStr = loginData.token || loginData.Token || loginData.access_token;
           tokenExpiry = Date.now() + 3500000;
-          await kv.put('__token_data__', JSON.stringify({ token: tokenStr, expire: tokenExpiry, apiUser: HAOZHU.user, apiPass: HAOZHU.pass }));
+          await setSetting('__token_data__', { token: tokenStr, expire: tokenExpiry, apiUser: HAOZHU.user, apiPass: HAOZHU.pass });
         } else {
           throw new Error('接码平台登录失败：' + (loginData.msg || ''));
         }
@@ -123,14 +127,14 @@ export async function onRequest(context) {
     // ====== 业务分发 ======
     switch (action) {
       case 'getApiConfig': {
-        const cfg = await kv.get('__api_config__', { type: 'json' }) || {};
+        const cfg = await getSetting('__api_config__') || {};
         return jsonResponse({ success: true, apiUser: cfg.user || '', apiPass: cfg.pass || '', sid: cfg.sid || '24085', ascription: cfg.ascription || '', paragraph: cfg.paragraph || '', exclude: cfg.exclude || '', uid: cfg.uid || '' });
       }
 
       case 'saveApiConfig': {
         const newUser = url.searchParams.get('apiUser');
         const newPass = url.searchParams.get('apiPass');
-        const existing = await kv.get('__api_config__', { type: 'json' }) || {};
+        const existing = await getSetting('__api_config__') || {};
         let finalUser = existing.user || '';
         let finalPass = existing.pass || '';
 
@@ -143,8 +147,10 @@ export async function onRequest(context) {
           ascription: url.searchParams.get('ascription') || '', paragraph: url.searchParams.get('paragraph') || '',
           exclude: url.searchParams.get('exclude') || '', uid: url.searchParams.get('uid') || ''
         };
-        await kv.put('__api_config__', JSON.stringify(newConfig));
-        if (finalUser !== existing.user || finalPass !== existing.pass) await kv.delete('__token_data__');
+        await setSetting('__api_config__', newConfig);
+        if (finalUser !== existing.user || finalPass !== existing.pass) {
+          await db.prepare(`DELETE FROM settings WHERE key='__token_data__'`).run();
+        }
         return jsonResponse({ success: true });
       }
 
@@ -175,7 +181,6 @@ export async function onRequest(context) {
       }
 
       case 'listActiveOrders': {
-        // 查 D1 代替以前的大 JSON
         const now = Date.now();
         const { results } = await db.prepare(`SELECT oid, phone, expire_at as expire FROM orders WHERE status='active' AND expire_at > ?`).bind(now).all();
         return jsonResponse({ orders: results });
@@ -186,7 +191,7 @@ export async function onRequest(context) {
         const limit = Math.min(parseInt(url.searchParams.get('limit')) || 100, 200);
         const start = cursorStr ? Math.max(parseInt(cursorStr) || 0, 0) : 0;
         
-        const { results, success } = await db.prepare(
+        const { results } = await db.prepare(
           `SELECT * FROM orders WHERE status='done' ORDER BY created_at DESC LIMIT ? OFFSET ?`
         ).bind(limit, start).all();
 
@@ -196,7 +201,6 @@ export async function onRequest(context) {
           createdAt: o.created_at, phoneAssignedAt: o.phone_assigned_at
         }));
         
-        // 获取总数以便前端判断是否有下一页
         const countRes = await db.prepare(`SELECT COUNT(*) as total FROM orders WHERE status='done'`).first();
         
         return jsonResponse({
@@ -238,19 +242,16 @@ export async function onRequest(context) {
         return jsonResponse({ success: true });
       }
 
-      // ====== 核心取号 ======
       case 'getPhone': {
         const order = await db.prepare(`SELECT * FROM orders WHERE oid=?`).bind(oid).first();
         if (!order) return jsonResponse({ error: '订单不存在或已失效' }, 404);
         if (order.status === 'done') return jsonResponse({ error: '订单已完成' }, 403);
         if (order.status === 'released') return jsonResponse({ error: '订单已被管理员释放' }, 403);
 
-        // 如果已经是 active 且未过期，直接返回
         if (order.status === 'active' && order.expire_at && Date.now() < order.expire_at) {
           return jsonResponse({ phone: order.phone, expire: order.expire_at });
         }
 
-        // 清理可能存在的旧号
         if (order.phone) {
           await releaseOrderPhone({ phone: order.phone, fromPool: order.from_pool, sid: order.sid }, oid);
         }
@@ -311,13 +312,11 @@ export async function onRequest(context) {
         return jsonResponse({ error: phoneData.msg || '取号失败' }, 500);
       }
 
-      // ====== 轮询验证码 (关键：纯读，不写！) ======
       case 'getSMS': {
         const order = await db.prepare(`SELECT * FROM orders WHERE oid=?`).bind(oid).first();
         if (!order) return jsonResponse({ error: '订单不存在' }, 404);
 
         if (order.status === 'active' && order.expire_at && Date.now() >= order.expire_at) {
-          // 过期了不写库！依靠定时任务清理，直接返回给前端即可
           return jsonResponse({ status: 'expired', code: null });
         }
 
@@ -338,7 +337,6 @@ export async function onRequest(context) {
             const match = raw.match(/(?<!\d)(\d{4,6})(?!\d)/);
             if (match) {
               const code = match[1];
-              // 收到验证码，更新一次 D1 状态
               await db.prepare(`UPDATE orders SET code=?, status='done', done_time=? WHERE oid=?`)
                 .bind(code, Date.now(), oid).run();
               await addLog(order.phone, oid, 'sms_received');
@@ -353,11 +351,9 @@ export async function onRequest(context) {
         const order = await db.prepare(`SELECT * FROM orders WHERE oid=?`).bind(oid).first();
         if (!order) return jsonResponse({ status: 'invalid', phone: null, expire: null, code: null });
         
-        // 过期处理也不写库
         if (order.status === 'active' && order.expire_at && Date.now() >= order.expire_at) {
           return jsonResponse({ status: 'expired', phone: order.phone, expire: null, code: null });
         }
-        
         return jsonResponse({ status: order.status, phone: order.phone, expire: order.expire_at, code: order.code });
       }
 
@@ -377,7 +373,7 @@ export async function onRequest(context) {
         return jsonResponse({ logs: results });
       }
 
-      // ====== 保留原有的卡密、号码池、余额等功能（原封不动）======
+      // ====== 保留原有功能 ======
       case 'generateCard': {
         const type = url.searchParams.get('type') || 'trial';
         const count = parseInt(url.searchParams.get('count')) || 1;
