@@ -1039,7 +1039,8 @@
                     }
                     enableGetButtons();
                     showUI('error');
-                    errorMessage.textContent = e.message;
+                    // 【修改点1】：替换为友好提示，不再直接展示后端返回的错误
+                    errorMessage.textContent = '后台暂时无可使用号码，请联系商家';
                 } finally {
                     isGettingPhone = false;
                 }
@@ -1135,7 +1136,8 @@
                         return;
                     }
                     showUI('error');
-                    errorMessage.textContent = e.message;
+                    // 【修改点2】：替换为友好提示，不再直接展示后端返回的错误
+                    errorMessage.textContent = '后台暂时无可使用号码，请联系商家';
                 }
             }
 
